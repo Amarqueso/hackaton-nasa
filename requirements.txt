@@ -1,0 +1,6 @@
+earthengine-api
+streamlit
+streamlit-folium
+folium
+pandas
+python-dotenv
