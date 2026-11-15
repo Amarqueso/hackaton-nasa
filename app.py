@@ -122,14 +122,16 @@ class _NaoEstaNoCache(Exception):
 
 def _so_cache(): raise _NaoEstaNoCache
 
-@st.cache_data(show_spinner=False)
-def clima_power(lat, lon, _calc=None):
-    """Clima da célula da POWER com centro (lat, lon). O cache é por célula. `_calc` fica fora da chave do cache
-    (começa com _) e serve para `coletar` ler ou preencher o cache na thread principal (ver `coletar`)."""
+@st.cache_data(show_spinner=False, persist="disk")
+def clima_power(lat, lon, ano_fim, _calc=None):
+    """Clima da célula da POWER com centro (lat, lon), média mensal de 2015 a `ano_fim`. O cache é por célula e
+    fica em disco (sobrevive a um reinício; falha não é gravada porque a exceção sobe). Sem ttl, que o Streamlit
+    ignora com persist="disk": `ano_fim` está na chave, então na virada do ano a consulta é outra. `_calc` fica fora
+    da chave do cache (começa com _) e serve para `coletar` ler ou preencher o cache na thread principal."""
     if _calc: return _calc()
     r = requests.get("https://power.larc.nasa.gov/api/temporal/monthly/point", timeout=40, params=dict(
         parameters="T2M,PRECTOTCORR,RH2M", community="AG", longitude=lon, latitude=lat,
-        start=2015, end=TODAY.year - 1, format="JSON"))
+        start=2015, end=ano_fim, format="JSON"))
     r.raise_for_status(); p = r.json()["properties"]["parameter"]
     def med(par, m):
         v = [x for k, x in p[par].items() if len(k) == 6 and k.endswith(f"{m:02d}") and x > -900]
@@ -180,7 +182,7 @@ def coletar(gj):
     terra exata e ficam no cache de coletar (por gj). d/erros são montados na thread principal.
     O Earth Engine usa a sessão aberta uma vez em init_ee."""
     lat, lon = centro_de(gj)
-    regionais = {"clima": (clima_power, celula(lat, lon, GRADE_POWER))}
+    regionais = {"clima": (clima_power, (*celula(lat, lon, GRADE_POWER), TODAY.year - 1))}
     tarefas = {}
     if EE_OK:
         geom = ee.Geometry(json.loads(gj))
