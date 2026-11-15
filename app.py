@@ -300,7 +300,7 @@ def confianca(d):
     n = sum(d.get(k) is not None for k in ("clima", "terreno", "solo", "veg"))
     return "alta" if n == 4 else "média" if n >= 2 else "baixa"
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=3600)
 def layers(gj):
     geom = ee.Geometry(json.loads(gj)); box = geom.buffer(1500).bounds()
     end = ee.Date(TODAY.isoformat())

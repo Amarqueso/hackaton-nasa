@@ -76,7 +76,7 @@ class Expr:
             if nome == "getInfo":
                 return self._fake.responder(lin)
             if nome == "getMapId":
-                return {"tile_fetcher": types.SimpleNamespace(url_format="https://fake/{z}/{x}/{y}")}
+                return self._fake.mapear(lin)
             return Expr(self._fake, lin)
         return metodo
 
@@ -89,6 +89,8 @@ class FakeEE(types.ModuleType):
         super().__init__("ee")
         self.init_erro = init_erro
         self.chamadas = Counter()
+        self.mapas = []
+        self.mapa_erro = None
         self.threads = {}
         self._trava = threading.Lock()
         self.respostas = {
@@ -113,6 +115,14 @@ class FakeEE(types.ModuleType):
 
     def Geometry(self, g, *a, **kw):
         return Expr(self, {"geom:" + json.dumps(g, sort_keys=True)})
+
+    def mapear(self, linhagem):
+        with self._trava:
+            url = f"https://fake/{len(self.mapas) + 1}/{{z}}/{{x}}/{{y}}"
+            self.mapas.append((frozenset(linhagem), url))
+        if self.mapa_erro:
+            raise self.mapa_erro
+        return {"tile_fetcher": types.SimpleNamespace(url_format=url)}
 
     def _fonte(self, x=None, *a, **kw):
         return Expr(self, {x} if isinstance(x, str) else set())
