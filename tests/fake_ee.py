@@ -67,6 +67,8 @@ class Expr:
 
         def metodo(*args, **kw):
             lin = self._juntar(list(args) + list(kw.values()))
+            if nome == "filterDate" and all(isinstance(a, str) for a in args):
+                lin.add("filterDate:" + json.dumps(args))
             if nome == "map":  # ee.List.map / ImageCollection.map: roda a função para pegar a linhagem
                 for a in args:
                     if callable(a) and not isinstance(a, Expr):
@@ -115,6 +117,9 @@ class FakeEE(types.ModuleType):
 
     def Geometry(self, g, *a, **kw):
         return Expr(self, {"geom:" + json.dumps(g, sort_keys=True)})
+
+    def Date(self, valor):
+        return Expr(self, {"date:" + valor} if isinstance(valor, str) else valor._lin)
 
     def mapear(self, linhagem):
         with self._trava:

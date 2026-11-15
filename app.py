@@ -21,7 +21,7 @@ except Exception as _e:
     EE_OK, EE_ERRO = False, str(_e)[:300]
 
 TODAY = dt.date.today()
-START = dt.date(TODAY.year - 1, TODAY.month, 1)  # janela de 12 meses
+REFERENCIA = TODAY.replace(day=1).isoformat()  # cache mensal; janela de 12 meses termina no mês passado
 NDVI_VIS = {"min": 0, "max": 0.9, "palette": ["#8c510a", "#d8b365", "#f6e8c3", "#a6d96a", "#1a9850", "#006837"]}
 SAR_VIS = {"min": -25, "max": -5}
 # Limites do mapa: DF (lat -16.05/-15.50, lon -48.29/-47.31) + ~50 km de margem
@@ -44,9 +44,9 @@ def s1(geom):
             .filter(ee.Filter.eq("instrumentMode", "IW"))
             .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VH")).select("VH"))
 
-def month_series(build, band, geom, scale, n=12):
+def month_series(build, band, geom, scale, inicio, n=12):
     def f(i):
-        s = ee.Date(START.isoformat()).advance(i, "month")
+        s = ee.Date(inicio).advance(i, "month")
         v = build(s, s.advance(1, "month")).reduceRegion(ee.Reducer.mean(), geom, scale, maxPixels=1e9).get(band, -9999)
         return ee.Feature(None, {"m": s.format("YYYY-MM"), "v": v})
     feats = ee.FeatureCollection(ee.List.sequence(0, n - 1).map(f)).getInfo()["features"]
@@ -148,14 +148,16 @@ def terreno(geom):
     return dict(alt=r["elevation"], decl=r["slope"])
 
 @st.cache_data(show_spinner=False)
-def umidade_solo(lat, lon, _calc=None):
+def umidade_solo(lat, lon, referencia, _calc=None):
     """Umidade do solo (0-10 cm, NASA FLDAS, mensal, 0,1° ≈ 11 km) no pixel com centro (lat, lon): último mês
     publicado vs. o mesmo mês de 2010 até o ano anterior ao dele. A série inteira vem num único getInfo e o percentil
-    é calculado aqui. O cache é por pixel; `_calc` como em `clima_power`."""
+    é calculado aqui. O cache é por pixel e mês de referência; `_calc` como em `clima_power`."""
     if _calc: return _calc()
     ponto, banda = ee.Geometry({"type": "Point", "coordinates": [lon, lat]}), "SoilMoi00_10cm_tavg"
+    ref = dt.date.fromisoformat(referencia)
+    fim = dt.date(ref.year + (ref.month == 12), ref.month % 12 + 1, 1)  # inclui o mês de referência, se publicado
     col = (ee.ImageCollection("NASA/FLDAS/NOAH01/C/GL/M/V001").select(banda)
-           .filterDate("2010-01-01", (TODAY + dt.timedelta(days=1)).isoformat()))
+           .filterDate("2010-01-01", fim.isoformat()))
     feats = ee.FeatureCollection(col.map(lambda img: ee.Feature(None, {
         "m": img.date().format("YYYY-MM"),
         "v": img.reduceRegion(ee.Reducer.mean(), ponto, 11132).get(banda)}))).getInfo()["features"]
@@ -173,23 +175,25 @@ def umidade_solo(lat, lon, _calc=None):
 def _ou_none(ser): return None if ser.dropna().empty else ser
 
 @st.cache_data(show_spinner=False)
-def coletar(gj):
+def coletar(gj, referencia):
     """Junta tudo o que o satélite sabe da área. O que falhar fica None (e a tela avisa que não temos o dado).
     As consultas rodam ao mesmo tempo, uma thread por consulta. Nas threads não há nenhuma chamada st.*.
     Clima e solo são regionais e têm cache por célula da grade de cada fonte (ver `_so_cache`): aqui, na thread
     principal, cada um é lido do cache da célula; se não estiver lá, a thread roda a função sem o cache
     (`__wrapped__`) e o resultado é guardado no cache da célula depois, também aqui. Terreno e NDVI dependem da
-    terra exata e ficam no cache de coletar (por gj). d/erros são montados na thread principal.
+    terra exata e ficam no cache de coletar (por gj e mês). d/erros são montados na thread principal.
     O Earth Engine usa a sessão aberta uma vez em init_ee."""
     lat, lon = centro_de(gj)
-    regionais = {"clima": (clima_power, (*celula(lat, lon, GRADE_POWER), TODAY.year - 1))}
+    ref = dt.date.fromisoformat(referencia)
+    inicio = ref.replace(year=ref.year - 1).isoformat()
+    regionais = {"clima": (clima_power, (*celula(lat, lon, GRADE_POWER), ref.year - 1))}
     tarefas = {}
     if EE_OK:
         geom = ee.Geometry(json.loads(gj))
-        regionais["solo"] = (umidade_solo, celula(lat, lon, GRADE_FLDAS))
+        regionais["solo"] = (umidade_solo, (*celula(lat, lon, GRADE_FLDAS), referencia))
         tarefas["terreno"] = lambda: terreno(geom)
         tarefas["veg"] = lambda: _ou_none(month_series(lambda s, e: ee.ImageCollection("MODIS/061/MOD13Q1")
-                .filterDate(s, e).select("NDVI").mean(), "NDVI", geom, 250) * 1e-4)
+                .filterDate(s, e).select("NDVI").mean(), "NDVI", geom, 250, inicio) * 1e-4)
     do_cache = {}  # clima/solo já no cache da célula: lidos aqui, na thread principal, sem consultar
     for k, (fn, cel) in regionais.items():
         try: do_cache[k] = fn(*cel, _calc=_so_cache)
@@ -213,10 +217,12 @@ def coletar(gj):
     return d
 
 @st.cache_data(show_spinner=False)
-def radar_vh(gj):
+def radar_vh(gj, referencia):
     """Série mensal do radar Sentinel-1 VH com filtro Lee (só no modo técnico; None se não houver imagem)."""
     geom = ee.Geometry(json.loads(gj))
-    return _ou_none(month_series(lambda s, e: lee(s1(geom).filterDate(s, e).median()).rename("VH"), "VH", geom, 30))
+    ref = dt.date.fromisoformat(referencia)
+    inicio = ref.replace(year=ref.year - 1).isoformat()
+    return _ou_none(month_series(lambda s, e: lee(s1(geom).filterDate(s, e).median()).rename("VH"), "VH", geom, 30, inicio))
 
 # ---------------- Recomendação (regras explicáveis) ----------------
 def janela(mes, n): return [(mes - 1 + i) % 12 + 1 for i in range(max(1, min(n, 4)))]
@@ -303,9 +309,10 @@ def confianca(d):
     return "alta" if n == 4 else "média" if n >= 2 else "baixa"
 
 @st.cache_data(show_spinner=False, ttl=3600)
-def layers(gj):
+def layers(gj, referencia, _hoje):
+    # A chave muda na virada do mês. Ao renovar pelo ttl, a janela diária termina no dia da consulta.
     geom = ee.Geometry(json.loads(gj)); box = geom.buffer(1500).bounds()
-    end = ee.Date(TODAY.isoformat())
+    end = ee.Date(_hoje)
     hls = (ee.ImageCollection("NASA/HLS/HLSL30/v002").filterBounds(geom).filterDate(end.advance(-120, "day"), end)
            .map(lambda i: i.updateMask(i.select("Fmask").bitwiseAnd(14).eq(0)).normalizedDifference(["B5", "B4"]))
            .median().clip(box))
@@ -501,7 +508,7 @@ else:
 left, right = st.columns([1.7, 1], gap="large")
 with left:
     try:
-        urls = layers(gj) if (gj and tecnico and EE_OK) else {}
+        urls = layers(gj, REFERENCIA, TODAY.isoformat()) if (gj and tecnico and EE_OK) else {}
     except Exception:
         urls = {}  # o mapa continua funcionando sem as camadas
     out = st_folium(construir_mapa(gj, urls, modo == M_DESENHO), height=600, use_container_width=True,
@@ -542,7 +549,7 @@ with right, st.container(border=True):
     ult_nome = st.selectbox("O que plantou por último nesta terra?", [NUNCA, PARADA] + [c["nome"] for c in CAT], key="ult")
 
 with st.spinner("Consultando os satélites… pode levar um minuto."):
-    d = coletar(gj)
+    d = coletar(gj, REFERENCIA)
 perfil = dict(nivel=NIVEIS[nivel], irriga=AGUA[irriga], obj=OBJ[obj], ha=ha)
 ultimo = POR_NOME.get(ult_nome)
 ok, motivos = ranking(d, perfil, mes, ultimo)
@@ -591,7 +598,7 @@ html(f'<p class="nota"><b>Confiança da sugestão: {conf}.</b> ' + {"alta": "Con
 radar, erros = None, dict(d.get("erros", {}))
 if tecnico and EE_OK:  # o radar não entra na recomendação: só é consultado no modo técnico
     with st.spinner("Carregando o radar…"):
-        try: radar = radar_vh(gj)
+        try: radar = radar_vh(gj, REFERENCIA)
         except Exception as e: erros["radar"] = str(e)[:300]
 
 with st.expander("Parecer técnico (para quem entende do assunto)"):
