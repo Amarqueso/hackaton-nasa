@@ -1,32 +1,49 @@
-"""RotaDF - guia de plantio para produtores do Distrito Federal.
-Clique no mapa -> clima, terreno e época -> o que plantar e o que plantar depois (rotação).
-Rodar: earthengine authenticate ; streamlit run app.py   (.env: GEE_PROJECT=seu-projeto)
+"""RotaDF - sugestão de rotação de culturas para produtores do Distrito Federal.
+Desenhe uma área no mapa -> NDVI (NASA), chuva (GPM), relevo (SRTM), radar filtrado (Lee) -> comparação de rotações.
+Rodar: earthengine authenticate ; GEE_PROJECT=seu-projeto streamlit run app.py
 """
 from dotenv import load_dotenv
 load_dotenv()
-import os, json, math, datetime as dt
-import ee, folium, pandas as pd, requests, streamlit as st
+import os, json, calendar, datetime as dt
+import ee, folium, pandas as pd, streamlit as st
 from folium.plugins import Draw
 from streamlit_folium import st_folium
+import enso, zarc, aptidao
 
-st.set_page_config(page_title="RotaDF", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="RotaDF", layout="wide")
 
 @st.cache_resource
 def init_ee():
     ee.Initialize(project=os.environ.get("GEE_PROJECT"))
-try:
-    init_ee(); EE_OK, EE_ERRO = True, ""
-except Exception as _e:
-    EE_OK, EE_ERRO = False, str(_e)[:300]
+init_ee()
 
 TODAY = dt.date.today()
-START = dt.date(TODAY.year - 1, TODAY.month, 1)  # janela de 12 meses
+START = dt.date(TODAY.year - 1, TODAY.month, 1)  # janela de 12 meses completos
+MOD = ee.ImageCollection("MODIS/061/MOD13Q1")
+IMERG = ee.ImageCollection("NASA/GPM_L3/IMERG_MONTHLY_V07")
 NDVI_VIS = {"min": 0, "max": 0.9, "palette": ["#8c510a", "#d8b365", "#f6e8c3", "#a6d96a", "#1a9850", "#006837"]}
 SAR_VIS = {"min": -25, "max": -5}
 # Limites do mapa: DF (lat -16.05/-15.50, lon -48.29/-47.31) + ~50 km de margem
 DF_BOUNDS = dict(min_lat=-16.50, max_lat=-15.05, min_lon=-48.76, max_lon=-46.84)
-MES = ["janeiro", "fevereiro", "março", "abril", "maio", "junho", "julho", "agosto", "setembro", "outubro", "novembro", "dezembro"]
-DIAS = [31, 28.25, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+
+SAFRINHA = "Soja e depois milho safrinha"
+# Notas qualitativas (0-5, maior = melhor). Heurística a validar com Emater-DF/Embrapa.
+STRATS = {
+    "Soja e depois terra descansando (pousio)": dict(agua=4, cobertura=1, renda=2, solo=1,
+        bom="Não gasta água nem dinheiro com um segundo plantio.",
+        risco="A terra fica sem plantas na seca: o solo pode ser levado pela chuva e perder fertilidade."),
+    SAFRINHA: dict(agua=1, cobertura=3, renda=5, solo=3,
+        bom="É uma segunda colheita no ano: a opção que mais rende.",
+        risco="Depende da chuva de abril e maio; se faltar chuva, pode perder a safra."),
+    "Soja e depois milho com capim (braquiária)": dict(agua=2, cobertura=5, renda=4, solo=4,
+        bom="Cobre bem a terra, segura a água e deixa o solo mais fértil; o capim ainda pode virar pasto.",
+        risco="Pede mais manejo (capim e palhada) e algum investimento no começo."),
+    "Soja e depois plantas de cobertura (milheto/crotalária)": dict(agua=3, cobertura=4, renda=1, solo=5,
+        bom="Protege o solo, e a crotalária ajuda a adubar a terra com nitrogênio.",
+        risco="Não dá renda direta; precisa planejar bem o plantio e o manejo."),
+}
+PRIOR = {"💧 Gastar menos água": "agua", "🛡️ Proteger o solo da erosão": "cobertura",
+         "💰 Ganhar mais": "renda", "🌿 Deixar a terra mais fértil": "solo"}
 
 def lee(img, size=2, enl=4.4):
     """Filtro Lee adaptativo (speckle) em escala linear; entrada e saída em dB."""
@@ -52,195 +69,29 @@ def month_series(build, band, geom, scale, n=12):
     ser = pd.Series({x["properties"]["m"]: x["properties"].get("v") for x in feats}, dtype="float")
     return ser.where(ser > -9000)  # meses sem dado (ex.: IMERG ainda não publicado) viram NaN
 
-# ---------------- Culturas (referência agronômica geral, a validar com Emater-DF / Embrapa) ----------------
-K = "nome emoji fam meses tmin tmax agua irrig dif fixa_n obj ciclo ha_min cobre desc".split()
-_C = [
- ("Soja","🌱","Fabaceae",{10,11,12},20,30,"alta",0,3,1,{"renda"},4,20,0,"Plantada nas chuvas; pede máquinas e insumos."),
- ("Milho","🌽","Poaceae",{10,11,12,1,2},18,30,"média",0,2,0,{"renda","comida"},4,3,0,"Grão ou milho verde; boa para vender e para a família."),
- ("Feijão","🫘","Fabaceae",{10,11,2,3,5,6,7},15,27,"média",0,2,1,{"comida","renda"},3,0.5,0,"Ciclo curto e ajuda a adubar a terra com nitrogênio."),
- ("Sorgo","🌾","Poaceae",{11,12,1,2,3},20,32,"baixa",0,1,0,{"renda","terra"},4,5,0,"Aguenta seca; bom depois da soja ou do milho."),
- ("Mandioca","🥔","Euphorbiaceae",{9,10,11,12,4,5},18,30,"baixa",0,1,0,{"comida","renda"},8,0.3,0,"Rústica e fácil; aguenta pouca chuva."),
- ("Batata-doce","🍠","Convolvulaceae",{10,11,12,1,2,3},20,30,"baixa",0,1,0,{"comida"},4,0.2,1,"Fácil, cobre o chão e aguenta pouca água."),
- ("Abóbora","🎃","Cucurbitaceae",{9,10,11,12,1,2},20,30,"média",0,1,0,{"comida","renda"},4,0.3,1,"Fácil de cultivar e cobre bem o solo."),
- ("Adubo verde (crotalária/milheto)","🌿","Adubo verde",{10,11,12,1,2,3,4},20,32,"baixa",0,1,1,{"terra"},3,0,1,"Não dá colheita, mas protege e aduba o solo."),
- ("Capim para pasto (braquiária)","🐄","Poaceae",{10,11,12,1,2,3},20,32,"baixa",0,1,0,{"terra","renda"},24,2,1,"Cobre o solo e serve de pasto para o gado."),
- ("Alface","🥬","Asteraceae",{3,4,5,6,7,8,9},14,24,"alta",1,2,0,{"renda","comida"},2,0.05,0,"Colheita rápida; não gosta de calor e pede irrigação."),
- ("Couve","🥬","Brassicaceae",{2,3,4,5,6,7,8,9},15,26,"média",0,1,0,{"comida","renda"},3,0.05,0,"Resistente e de colheita longa."),
- ("Cheiro-verde (salsa e cebolinha)","🌿","Cheiro-verde",{3,4,5,6,7,8,9},14,26,"média",1,1,0,{"renda","comida"},3,0.05,0,"Pouco espaço, boa venda em feiras."),
- ("Tomate","🍅","Solanaceae",{3,4,5,6},18,28,"alta",1,3,0,{"renda"},5,0.2,0,"Rende bem, mas dá trabalho e tem muitas doenças."),
- ("Cenoura","🥕","Apiaceae",{3,4,5,6,7,8},15,25,"média",1,2,0,{"renda","comida"},4,0.2,0,"Gosta de clima mais fresco e de solo solto."),
- ("Morango","🍓","Rosaceae",{4,5,6},14,25,"alta",1,3,0,{"renda"},8,0.1,0,"Muito valorizado; exige cuidado e irrigação."),
- ("Café","☕","Rubiaceae",{11,12,1,2},18,25,"média",0,3,0,{"renda"},36,2,1,"Cultura de vários anos; demora a dar colheita."),
- ("Goiaba","🍈","Myrtaceae",{11,12,1,2,3},18,30,"média",0,2,0,{"renda","comida"},60,0.5,1,"Fruteira de vários anos, tradicional no DF."),
-]
-CAT = [dict(zip(K, r)) for r in _C]
-POR_NOME = {c["nome"]: c for c in CAT}
-
-NIVEIS = {"Nunca plantei": 1, "Já planto": 2, "Tenho experiência": 3}
-AGUA = {"Só chuva": False, "Posso irrigar": True}
-OBJ = {"Renda": "renda", "Alimentação": "comida", "Cuidar da terra": "terra"}
-TAM = {"Pequena (cerca de 2 hectares)": 2, "Média (cerca de 10 hectares)": 10,
-       "Grande (cerca de 50 hectares)": 50, "Muito grande (cerca de 200 hectares)": 200}
-NUNCA, PARADA = "Nunca plantei / não sei", "Terra parada (nada)"
-
-# ---------------- Geografia ----------------
-def pontos(gj): return json.loads(gj)["coordinates"][0]
-
-def centro_de(gj):
-    p = pontos(gj)[:-1]
-    return sum(x[1] for x in p) / len(p), sum(x[0] for x in p) / len(p)
-
-def area_ha(gj):
-    p = pontos(gj); c = math.cos(math.radians(centro_de(gj)[0]))
-    xy = [(x[0] * 111320 * c, x[1] * 110540) for x in p]
-    return abs(sum(a[0] * b[1] - b[0] * a[1] for a, b in zip(xy, xy[1:]))) / 2 / 1e4
-
-def quadrado(lat, lon, ha):
-    meio = math.sqrt(ha * 1e4) / 2; dy = meio / 110540; dx = meio / (111320 * math.cos(math.radians(lat)))
-    return json.dumps({"type": "Polygon", "coordinates": [[[lon - dx, lat - dy], [lon + dx, lat - dy],
-                       [lon + dx, lat + dy], [lon - dx, lat + dy], [lon - dx, lat - dy]]]})
-
-# ---------------- Dados: NASA POWER (clima) e Earth Engine (terreno, umidade do solo, vegetação, radar) ----------------
-@st.cache_data(show_spinner=False)
-def clima_power(lat, lon):
-    r = requests.get("https://power.larc.nasa.gov/api/temporal/monthly/point", timeout=40, params=dict(
-        parameters="T2M,PRECTOTCORR,RH2M", community="AG", longitude=lon, latitude=lat,
-        start=2015, end=TODAY.year - 1, format="JSON"))
-    r.raise_for_status(); p = r.json()["properties"]["parameter"]
-    def med(par, m):
-        v = [x for k, x in p[par].items() if len(k) == 6 and k.endswith(f"{m:02d}") and x > -900]
-        return sum(v) / len(v) if v else None
-    out = {}
-    for m in range(1, 13):
-        ch = med("PRECTOTCORR", m)
-        out[m] = dict(t=med("T2M", m), chuva=None if ch is None else ch * DIAS[m - 1], ur=med("RH2M", m))
-    return out
-
-def terreno(geom):
-    e = ee.Image("USGS/SRTMGL1_003")
-    r = e.addBands(ee.Terrain.slope(e)).reduceRegion(ee.Reducer.mean(), geom, 30, maxPixels=1e9).getInfo()
-    return dict(alt=r["elevation"], decl=r["slope"])
-
-def umidade_solo(geom):
-    """Umidade do solo (0-10 cm, NASA GLDAS, ~25 km): último mês disponível vs. o mesmo mês em 2010-hoje."""
-    ponto, banda = geom.centroid(1), "SoilMoi0_10cm_inst"
-    col = ee.ImageCollection("NASA/GLDAS/V021/NOAH/G025/T3H").select(banda)
-    ser = month_series(lambda s, e: col.filterDate(s, e).mean(), banda, ponto, 27830).dropna()
-    if ser.empty: return None
-    mes, atual = int(ser.index[-1][5:]), float(ser.iloc[-1])
-    def f(y):
-        s = ee.Date.fromYMD(y, mes, 1)
-        v = col.filterDate(s, s.advance(1, "month")).mean().reduceRegion(ee.Reducer.mean(), ponto, 27830).get(banda, -9999)
-        return ee.Feature(None, {"v": v})
-    feats = ee.FeatureCollection(ee.List.sequence(2010, TODAY.year - 1).map(f)).getInfo()["features"]
-    vals = [x["properties"]["v"] for x in feats if x["properties"].get("v") is not None and x["properties"]["v"] > -9000]
-    return dict(pct=sum(v < atual for v in vals) / len(vals), mes=mes) if vals else None
-
-def _ou_none(ser): return None if ser.dropna().empty else ser
+def baseline(geom):
+    def f(m):
+        m = ee.Number(m)
+        img = (MOD.select("NDVI").filter(ee.Filter.calendarRange(2015, 2024, "year"))
+               .filter(ee.Filter.calendarRange(m, m, "month")).mean())
+        return ee.Feature(None, {"mo": m, "v": img.reduceRegion(ee.Reducer.mean(), geom, 250, maxPixels=1e9).get("NDVI")})
+    feats = ee.FeatureCollection(ee.List.sequence(1, 12).map(f)).getInfo()["features"]
+    return {int(x["properties"]["mo"]): x["properties"]["v"] * 1e-4 for x in feats if x["properties"].get("v") is not None}
 
 @st.cache_data(show_spinner=False)
-def coletar(gj):
-    """Junta tudo o que o satélite sabe da área. O que falhar fica None (e a tela avisa que não temos o dado)."""
-    lat, lon = centro_de(gj); d, erros = {}, {}
-    def tentar(k, fn):
-        try: d[k] = fn()
-        except Exception as e: d[k] = None; erros[k] = str(e)[:300]
-    tentar("clima", lambda: clima_power(round(lat, 1), round(lon, 1)))
-    if EE_OK:
-        geom = ee.Geometry(json.loads(gj))
-        tentar("terreno", lambda: terreno(geom))
-        tentar("solo", lambda: umidade_solo(geom))
-        tentar("veg", lambda: _ou_none(month_series(lambda s, e: ee.ImageCollection("MODIS/061/MOD13Q1")
-                .filterDate(s, e).select("NDVI").mean(), "NDVI", geom, 250) * 1e-4))
-        tentar("radar", lambda: _ou_none(month_series(lambda s, e: lee(s1(geom).filterDate(s, e).median()).rename("VH"), "VH", geom, 30)))
-    else:
-        erros["gee"] = EE_ERRO
-    d["erros"] = erros
-    return d
-
-# ---------------- Recomendação (regras explicáveis) ----------------
-def janela(mes, n): return [(mes - 1 + i) % 12 + 1 for i in range(max(1, min(n, 4)))]
-
-def clima_janela(clima, mes, n=4):
-    if not clima: return None
-    j = [clima[m] for m in janela(mes, n)]
-    if any(x["t"] is None or x["chuva"] is None for x in j): return None
-    ur = [x["ur"] for x in j]
-    return dict(t=sum(x["t"] for x in j) / len(j), chuva=sum(x["chuva"] for x in j),
-                ur=None if None in ur else sum(ur) / len(ur))
-
-def avaliar(c, d, p, mes, ultimo):
-    if mes not in c["meses"]: return "fora"
-    if c["irrig"] and not p["irriga"]: return "irrigar"
-    pts, bom, cuid = 50, [], []
-    cj = clima_janela(d.get("clima"), mes, c["ciclo"])
-    if cj:
-        if c["tmin"] - 1 <= cj["t"] <= c["tmax"] + 1:
-            pts += 15; bom.append(f"A temperatura esperada ({cj['t']:.0f} °C em média) combina com ela.")
-        else:
-            pts -= 25; cuid.append(f"Deve ficar {'quente' if cj['t'] > c['tmax'] else 'frio'} demais para ela ({cj['t']:.0f} °C em média).")
-        if not p["irriga"]:
-            if cj["chuva"] >= {"baixa": 150, "média": 300, "alta": 450}[c["agua"]]:
-                pts += 10; bom.append(f"Deve chover o bastante ({cj['chuva']:.0f} mm) sem precisar irrigar.")
-            else:
-                pts -= 40; cuid.append(f"Deve chover pouco ({cj['chuva']:.0f} mm) para ela sem irrigação.")
-    else:
-        cuid.append("Sem dado de clima agora: não deu para conferir se o tempo combina.")
-    if c["dif"] > p["nivel"]:
-        pts -= 20 * (c["dif"] - p["nivel"]); cuid.append("Pede mais experiência: vale buscar apoio da Emater-DF.")
-    elif p["nivel"] == 1 and c["dif"] == 1:
-        pts += 8; bom.append("É uma boa escolha para quem está começando.")
-    if p["ha"] < c["ha_min"]:
-        pts -= 25; cuid.append(f"Costuma compensar em áreas a partir de {c['ha_min']:g} hectares.")
-    if p["obj"] in c["obj"]:
-        pts += 12; bom.append({"renda": "Tem boa saída para venda.", "comida": "Serve bem para alimentar a família.",
-                               "terra": "Ajuda a cuidar da terra."}[p["obj"]])
-    if ultimo:
-        if ultimo["fam"] == c["fam"]:
-            pts -= 35; cuid.append(f"É da mesma família do que veio antes ({ultimo['nome']}): pode acumular pragas e doenças.")
-        elif c["fixa_n"] and not ultimo["fixa_n"]:
-            pts += 10; bom.append("Devolve nitrogênio ao solo depois do que veio antes.")
-        elif ultimo["fixa_n"] and c["fam"] == "Poaceae":
-            pts += 8; bom.append(f"Aproveita o nitrogênio que {ultimo['nome']} deixa no solo.")
-    t = d.get("terreno")
-    if t and t["decl"] > 6:
-        if c["cobre"]: pts += 10; bom.append("Protege o solo em um terreno inclinado.")
-        else: pts -= 10; cuid.append("O terreno é inclinado: a chuva pode levar o solo. Plante em curva de nível.")
-    veg = d.get("veg"); sem = int((veg < 0.3).sum()) if veg is not None else 0
-    if sem >= 4 and c["cobre"]:
-        pts += 6; bom.append(f"Cobre a terra, que ficou {sem} meses com pouca planta no último ano.")
-    s = d.get("solo")
-    if s and not p["irriga"] and s["pct"] < 0.3:
-        if c["agua"] == "baixa": pts += 8; bom.append("Aguenta bem o solo mais seco que o normal na região.")
-        elif c["agua"] == "alta": pts -= 8; cuid.append("O solo da região está mais seco que o normal.")
-    return dict(c, pts=max(0, min(100, round(pts))), bom=bom, cuid=cuid)
-
-NOTA_MIN = 50
-
-def ranking(d, p, mes, ultimo):
-    rs = [avaliar(c, d, p, mes, ultimo) for c in CAT]
-    ok = [r for r in rs if isinstance(r, dict) and r["pts"] >= NOTA_MIN]  # abaixo disso não vale recomendar
-    return sorted(ok, key=lambda r: -r["pts"]), [r for r in rs if isinstance(r, str)]
-
-def plano(d, p, mes, ultimo, passos=3):
-    """Sequência de plantios (rotação): cada passo escolhe a melhor cultura depois do ciclo da anterior."""
-    seq, m = [], mes
-    for _ in range(passos):
-        for espera in range(7):
-            ok, _ = ranking(d, p, (m - 1 + espera) % 12 + 1, ultimo)
-            if ok: break
-        else:
-            break
-        top, mm = ok[0], (m - 1 + espera) % 12 + 1
-        seq.append((mm, top, espera))
-        if top["ciclo"] >= 12: break  # cultura de vários anos: fica no lugar
-        m, ultimo = (mm - 1 + top["ciclo"]) % 12 + 1, top
-    return seq
-
-def confianca(d):
-    if d.get("clima") is None: return "baixa"
-    n = sum(d.get(k) is not None for k in ("clima", "terreno", "solo", "veg"))
-    return "alta" if n == 4 else "média" if n >= 2 else "baixa"
+def analyze(gj):
+    geom = ee.Geometry(json.loads(gj))
+    ndvi = month_series(lambda s, e: MOD.filterDate(s, e).select("NDVI").mean(), "NDVI", geom, 250) * 1e-4
+    base = baseline(geom)
+    # IMERG mensal vem em mm/h -> mm/mês; ponto central porque o pixel (~11 km) é maior que a área
+    rain = month_series(lambda s, e: IMERG.filterDate(s, e).select("precipitation").mean(), "precipitation",
+                        geom.centroid(1), 11132)
+    rain = pd.Series({k: v * 24 * calendar.monthrange(int(k[:4]), int(k[5:]))[1] for k, v in rain.items()})
+    sar = month_series(lambda s, e: lee(s1(geom).filterDate(s, e).median()).rename("VH"), "VH", geom, 30)
+    slope = ee.Terrain.slope(ee.Image("USGS/SRTMGL1_003")).reduceRegion(ee.Reducer.mean(), geom, 30).get("slope").getInfo()
+    df = pd.DataFrame({"NDVI": ndvi, "NDVI médio 2015-2024": [base.get(int(k[5:])) for k in ndvi.index],
+                       "Chuva (mm)": rain, "Radar VH filtrado (dB)": sar})
+    return df, slope, geom.area(1).getInfo() / 1e4
 
 @st.cache_data(show_spinner=False)
 def layers(gj):
@@ -251,10 +102,74 @@ def layers(gj):
            .median().clip(box))
     raw = s1(geom).filterDate(end.advance(-60, "day"), end).median()
     out = {"Saúde da vegetação (verde = saudável)": (hls, NDVI_VIS), "Radar (bruto, com ruído)": (raw.clip(box), SAR_VIS),
-           "Radar (filtrado)": (lee(raw).clip(box), SAR_VIS)}
+           "Radar (filtrado)": (lee(raw).clip(box), SAR_VIS),
+           "O que tem na área (água, construção, mata…)": (aptidao.dynamic_world(geom, TODAY.isoformat()).clip(box),
+                                                         {"min": 0, "max": 8, "palette": aptidao.DW_PALETA})}
     return {k: i.getMapId(v)["tile_fetcher"].url_format for k, (i, v) in out.items()}
 
+@st.cache_data(show_spinner=False)
+def cobertura(gj):
+    return aptidao.calcular(ee.Geometry(json.loads(gj)), TODAY.isoformat())
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def enso_atual():
+    return enso.obter()
+
+@st.cache_data(show_spinner=False)
+def zarc_base():
+    return zarc.carregar()
+
+# Limites do DF (o ZARC usado é o do município de Brasília, que cobre o DF inteiro)
+DF_LIMITES = (-16.05, -15.50, -48.29, -47.31)
+
+def dentro_df(gj):
+    pts = json.loads(gj)["coordinates"][0]
+    lat = sum(p[1] for p in pts) / len(pts); lon = sum(p[0] for p in pts) / len(pts)
+    return DF_LIMITES[0] <= lat <= DF_LIMITES[1] and DF_LIMITES[2] <= lon <= DF_LIMITES[3]
+
+def score(ev, chave, atual):
+    # a prioridade escolhida pesa 10x mais que as outras: assim cada escolha muda de fato o resultado
+    w, notes = {k: (5 if k == chave else 0.5) for k in ('agua', 'cobertura', 'renda', 'solo')}, []
+    en = ev.get("enso")
+    nino_forte = en and en["fase"] == "El Niño" and en["intensidade"] in ("moderado", "forte", "muito forte")
+    if nino_forte:
+        w["agua"] *= 1.3; w["cobertura"] *= 1.2
+        notes.append(f"O Pacífico está em **{enso.rotulo(en)}** (ONI {en['oni']:+.1f} °C): no DF isso costuma trazer "
+                     "chuva irregular e veranicos, então economizar água e manter palhada no solo vale mais.")
+    elif en and en["fase"] == "La Niña":
+        notes.append(f"O Pacífico está em **{enso.rotulo(en)}** (ONI {en['oni']:+.1f} °C): tendência de chuvas mais "
+                     "regulares no Centro-Oeste, mas fique atento a um fim de chuvas mais cedo.")
+    if ev["slope"] and ev["slope"] > 5:
+        w["cobertura"] *= 1.5; notes.append(f"Sua terra é inclinada (cerca de {ev['slope']:.0f}°): a chuva pode levar o solo, então manter a terra coberta é importante.")
+    if ev["bare"] >= 3:
+        w["cobertura"] *= 1.3; notes.append(f"No último ano, sua área ficou com pouca vegetação por cerca de {ev['bare']} meses.")
+    if ev["anom"] is not None and ev["anom"] < -0.05:
+        w["agua"] *= 1.3; notes.append("A vegetação nos últimos meses está mais fraca do que o normal para a época.")
+    rows = []
+    for n, a in STRATS.items():
+        s = sum(w[k] * a[k] for k in w) / (5 * sum(w.values())) * 100
+        if n == SAFRINHA and ev["rain_am"] is not None and ev["rain_am"] < 150:
+            s -= 15; notes.append(f"Choveu pouco em abril e maio ({ev['rain_am']:.0f} mm): o milho safrinha fica arriscado.")
+        if n == SAFRINHA and nino_forte:
+            s -= 10
+        # ZARC: há como encaixar soja + 2ª safra no calendário oficial, com o risco aceito para o clima do ano?
+        z = ev.get("zarc") or {}
+        if n in z and z[n] is not None and len(z[n]) == 0:
+            s -= 20
+            notes.append(f"Pelo ZARC de Brasília, com o risco máximo de {ev['zarc_tol']}% aceito neste ano, não há janela "
+                         f"segura para *{n.lower()}* no seu tipo de solo: a 2ª safra ficaria fora do zoneamento (sem seguro/Proagro).")
+        rows.append({"nome": n, "pontos": max(round(s), 0)})
+    return sorted(rows, key=lambda r: -r["pontos"]), notes
+
+def farol(v, bom, medio, alto_bom=True):
+    """Devolve 🟢/🟡/🔴 conforme o valor."""
+    ok = (v >= bom) if alto_bom else (v <= bom)
+    meio = (v >= medio) if alto_bom else (v <= medio)
+    return "🟢" if ok else ("🟡" if meio else "🔴")
+
 # --- MAPA ---
+import json, folium
+from folium.plugins import Draw
 from branca.element import MacroElement, Template
 
 class _TextoPT(MacroElement):
@@ -295,28 +210,29 @@ class _LimitarMapa(MacroElement):
         self.sul, self.oeste, self.norte, self.leste, self.zmin = b["min_lat"], b["min_lon"], b["max_lat"], b["max_lon"], zmin
 
 ZOOM_MIN = 9
-COR = "#F5B700"  # amarelo de ipê: contrasta com o satélite e com o mapa
+COR = "#ff5a1f"
 
-def construir_mapa(gj, urls, desenho):
+def construir_mapa(gj, urls):
     # obs.: com tiles=None o folium ignora min_zoom/max_zoom; os limites de zoom são aplicados em _LimitarMapa
     m = folium.Map(location=[-15.78, -47.80], zoom_start=10, tiles=None, max_bounds=True, **DF_BOUNDS)
     folium.TileLayer("OpenStreetMap", name="Mapa", no_wrap=True, show=False).add_to(m)
     folium.TileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
                      attr="Esri", name="Satélite", no_wrap=True).add_to(m)
-    if desenho:
-        _TextoPT().add_to(m)  # antes do Draw
-        Draw(draw_options={"polyline": False, "circle": False, "marker": False, "circlemarker": False,
-                           "polygon": {"allowIntersection": False, "shapeOptions": {"color": COR, "weight": 3},
-                                       "drawError": {"color": "#e1e100", "message": "As linhas não podem se cruzar."}},
-                           "rectangle": {"shapeOptions": {"color": COR, "weight": 3}}},
-             edit_options={"edit": False, "remove": False}).add_to(m)
+    _TextoPT().add_to(m)  # antes do Draw
+    Draw(draw_options={"polyline": False, "circle": False, "marker": False, "circlemarker": False,
+                       "polygon": {"allowIntersection": False, "shapeOptions": {"color": COR, "weight": 3},
+                                   "drawError": {"color": "#e1e100", "message": "As linhas não podem se cruzar."}},
+                       "rectangle": {"shapeOptions": {"color": COR, "weight": 3}}},
+         edit_options={"edit": False, "remove": False}).add_to(m)  # apagar é pelo botão "Apagar área"
     if gj:
-        pts = pontos(gj)
-        folium.GeoJson(json.loads(gj), name="Sua terra", style_function=lambda _: {"color": COR, "weight": 3, "fillOpacity": 0.15}).add_to(m)
+        geo = json.loads(gj)
+        pts = geo["coordinates"][0]
+        folium.GeoJson(geo, name="Sua área", style_function=lambda _: {"color": COR, "weight": 3, "fillOpacity": 0.08}).add_to(m)
         for name, url in urls.items():
-            folium.TileLayer(tiles=url, attr="Google Earth Engine", name=name, overlay=True, show=name.startswith("Saúde")).add_to(m)
+            folium.TileLayer(tiles=url, attr="Google Earth Engine", name=name, overlay=True,
+                             show=name.startswith("Saúde")).add_to(m)
         m.fit_bounds([[min(p[1] for p in pts), min(p[0] for p in pts)], [max(p[1] for p in pts), max(p[0] for p in pts)]],
-                     padding=(40, 40), max_zoom=15)  # centraliza na terra marcada
+                     padding=(40, 40), max_zoom=16)  # centraliza no polígono desenhado
     else:
         m.fit_bounds([[-16.07, -48.30], [-15.48, -47.30]])  # começa mostrando o DF inteiro
     folium.LayerControl(collapsed=True).add_to(m)
@@ -325,223 +241,215 @@ def construir_mapa(gj, urls, desenho):
 # --- FIM MAPA ---
 
 # ---------------- Interface ----------------
-import html as _h
-CSS = """
-@import url('https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Public+Sans:wght@400;500;600&display=swap');
-:root{--bg:#F2F4F1;--papel:#fff;--tinta:#16241D;--verde:#1D4D3B;--verde-cl:#DDE8E0;--ipe:#E8B000;--terra:#9C4A2F;--linha:#D9DFDA;--mut:#5F6B64}
-.stApp{background:var(--bg);color:var(--tinta)}
-.stApp,.stMarkdown,.stMarkdown p,label,button,input,[data-baseweb]{font-family:'Public Sans',system-ui,sans-serif}
-.block-container{max-width:1280px;padding:1.2rem 1.5rem 4rem}
-header[data-testid="stHeader"]{background:transparent}
-#MainMenu,footer{visibility:hidden}
-h1,h2,h3,h4,h5,.marca,.passo span,.trilha b{font-family:'Bricolage Grotesque',system-ui,sans-serif;color:var(--verde);letter-spacing:-.015em}
-.topo{display:flex;flex-wrap:wrap;align-items:baseline;gap:.3rem 1.2rem;padding:.2rem 0 1rem;border-bottom:1px solid var(--linha);margin-bottom:1.2rem}
-.marca{font-size:1.5rem;font-weight:700;display:inline-flex;align-items:center;gap:.5rem}
-.marca::before{content:"";width:.8rem;height:.8rem;border-radius:50%;background:var(--ipe)}
-.lema{color:var(--mut)}
-iframe[title*="folium"]{border:1px solid var(--linha);border-radius:12px;height:clamp(400px,68vh,700px)!important;background:#dfe6e0}
-[data-testid="stVerticalBlockBorderWrapper"]{border-color:var(--linha)!important;border-radius:12px;background:var(--papel)}
-[data-testid="stExpander"]{border:1px solid var(--linha);border-radius:12px;background:var(--papel)}
-[data-testid="stWidgetLabel"] p{font-size:.86rem;color:var(--mut);font-weight:500}
-.stButton button{border-radius:8px;border:1px solid var(--verde);color:var(--verde);background:transparent}
-.stButton button:hover{background:var(--verde-cl);border-color:var(--verde);color:var(--verde)}
-.passo{display:flex;align-items:center;gap:.6rem;margin:.3rem 0 .6rem}
-.passo b{width:1.6rem;height:1.6rem;border-radius:50%;background:var(--verde);color:#fff;display:grid;place-items:center;font-size:.85rem}
-.passo span{font-weight:700;font-size:1.2rem}
-h2.sec{font-size:1.6rem;margin:2.4rem 0 .9rem;font-weight:700}
-.destaque{background:var(--verde);color:#fff;border-radius:14px;padding:1.6rem 1.7rem}
-.destaque h3{color:#fff;font-size:1.8rem;margin:0 0 .2rem;font-weight:700}
-.destaque p{margin:0 0 1rem;color:#CFE0D6}
-.destaque small{color:#CFE0D6;display:block;margin-top:.4rem}
-.destaque .fit{background:rgba(255,255,255,.22)}
-.destaque .fit i{background:var(--ipe)}
-.destaque h5{color:#fff;font-size:1.02rem;margin:.2rem 0 .4rem}
-.duas{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:1rem 2.2rem;margin-top:1.2rem}
-.destaque ul{list-style:none;padding:0;margin:0}
-.destaque li{position:relative;padding-left:1.1rem;margin:.4rem 0;font-size:.95rem;line-height:1.45}
-.destaque li::before{content:"";position:absolute;left:0;top:.55em;width:.5rem;height:.5rem;border-radius:50%;background:#fff;opacity:.5}
-.destaque li.ok::before{background:var(--ipe);opacity:1}
-.fit{display:block;height:6px;border-radius:3px;background:var(--verde-cl);overflow:hidden;min-width:90px}
-.fit i{display:block;height:100%;background:var(--verde);border-radius:3px}
-.linha{display:grid;grid-template-columns:minmax(0,1.3fr) 150px minmax(0,1.6fr);gap:1rem;align-items:center;padding:.95rem .2rem;border-bottom:1px solid var(--linha)}
-.linha b{display:block;font-weight:600}
-.linha div span{display:block;color:var(--mut);font-size:.88rem}
-.linha p{margin:0;font-size:.92rem}
-.trilha{list-style:none;margin:0;padding:0;display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr))}
-.trilha li{position:relative;padding:1.2rem 1.2rem 0 0}
-.trilha li::before{content:"";position:absolute;top:0;left:0;right:0;border-top:2px solid var(--linha)}
-.trilha li::after{content:"";position:absolute;top:-5px;left:0;width:10px;height:10px;border-radius:50%;background:var(--ipe)}
-.trilha time{display:block;text-transform:capitalize;color:var(--mut);font-size:.88rem}
-.trilha b{font-size:1.25rem;display:block;font-weight:700}
-.trilha span{display:block;font-size:.9rem;margin-top:.2rem}
-.trilha em{display:block;color:var(--terra);font-size:.85rem;font-style:normal;margin-top:.3rem}
-.dados{margin:0;border-top:1px solid var(--linha)}
-.dados>div{display:grid;grid-template-columns:minmax(150px,1fr) minmax(120px,1fr) minmax(0,1.6fr);gap:.3rem 1rem;padding:.75rem 0;border-bottom:1px solid var(--linha)}
-.dados dt{font-weight:600}.dados dd{margin:0}
-.dados .fonte{color:var(--mut);font-size:.88rem}
-.dados .falta{color:var(--terra);font-weight:600}
-.nota{border-left:3px solid var(--ipe);padding:.3rem 1rem;margin:1rem 0;line-height:1.55}
-.mut{color:var(--mut);font-size:.92rem}
-@media (max-width:720px){.block-container{padding:.8rem .9rem 3rem}.linha{grid-template-columns:1fr;gap:.4rem}
-.dados>div{grid-template-columns:1fr}.destaque{padding:1.2rem}.destaque h3{font-size:1.45rem}h2.sec{font-size:1.35rem}}
-"""
-st.markdown(f"<style>{CSS}</style>", unsafe_allow_html=True)
-
-M_CLICK, M_DESENHO = "Clicar no mapa", "Desenhar contorno"
-for k, v in dict(map_v=0, centro=None, gj_desenho=None, ultimo_clique=None).items():
-    st.session_state.setdefault(k, v)
+st.title("🌱 Qual cultura plantar na sua terra?")
+st.caption("Marque sua propriedade no mapa e receba uma sugestão baseada em dados de satélite da NASA.")
+st.session_state.setdefault("map_v", 0)
 
 def limpar():
-    st.session_state.update(centro=None, gj_desenho=None, ultimo_clique=None)
-    st.session_state["map_v"] += 1  # mapa novo: some a marcação e volta a mostrar o DF
+    st.session_state["gj"] = None
+    st.session_state["map_v"] += 1  # novo mapa: some o desenho e volta a mostrar o DF
 
-def escolha(rotulo, opcoes, chave, **kw):
-    """Seletor em formato de botões (cai para radio em versões antigas do Streamlit)."""
-    f = getattr(st, "segmented_control", None)
-    if f is None: return st.radio(rotulo, opcoes, key=chave, horizontal=True, **kw)
-    return f(rotulo, opcoes, default=opcoes[0], key=chave, **kw) or opcoes[0]
+left, right = st.columns([3, 2], gap="large")
+gj = st.session_state.get("gj")
 
-esc = lambda x: _h.escape(str(x))
-html = lambda s: st.markdown(s, unsafe_allow_html=True)
-lis = lambda xs, c: "".join(f'<li class="{c}">{esc(x)}</li>' for x in xs)
-barra = lambda p: f'<span class="fit"><i style="width:{p}%"></i></span>'
-
-def destaque(r, mes):
-    rot = "Combina muito com a sua terra" if r["pts"] >= 70 else "Combina com a sua terra"
-    return ('<section class="destaque">' f'<h3>Plantar {esc(r["nome"])} em {MES[mes - 1]}</h3><p>{esc(r["desc"])}</p>'
-            f'{barra(r["pts"])}<small>{rot}</small><div class="duas">'
-            f'<div><h5>Por que combina</h5><ul>{lis(r["bom"][:4] or ["Sem pontos fortes com os dados que temos."], "ok")}</ul></div>'
-            f'<div><h5>Pontos de atenção</h5><ul>{lis(r["cuid"][:4] or ["Nenhum alerta com os dados que temos."], "nd")}</ul></div></div></section>')
-
-def linha(r):
-    t = (r["bom"] or r["cuid"] or [r["desc"]])[0]
-    return f'<div class="linha"><div><b>{esc(r["nome"])}</b><span>{esc(r["desc"])}</span></div>{barra(r["pts"])}<p>{esc(t)}</p></div>'
-
-def dado(rot, val, fonte):
-    v = f"<dd>{esc(val)}</dd>" if val else '<dd class="falta">Sem dado</dd>'
-    return f'<div><dt>{rot}</dt>{v}<dd class="fonte">{fonte}</dd></div>'
-
-with st.sidebar:
-    st.markdown("### Modo técnico")
-    tecnico = st.toggle("Camadas de vegetação e radar no mapa")
-    st.caption("Para quem entende de sensoriamento remoto. O parecer técnico completo fica no fim da página.")
-
-html('<div class="topo"><span class="marca">RotaDF</span>'
-     '<span class="lema">Guia de plantio para o Distrito Federal, com dados de satélite da NASA</span></div>')
-modo = st.session_state.get("modo") or M_CLICK
-ha_tam = TAM[st.session_state.get("tam", list(TAM)[1])]
-if modo == M_CLICK and st.session_state["centro"]:
-    gj = quadrado(*st.session_state["centro"], ha_tam)
-else:
-    gj = st.session_state["gj_desenho"] if modo == M_DESENHO else None
-
-left, right = st.columns([1.7, 1], gap="large")
 with left:
     try:
-        urls = layers(gj) if (gj and tecnico and EE_OK) else {}
+        urls = layers(gj) if gj else {}
     except Exception:
         urls = {}  # o mapa continua funcionando sem as camadas
-    out = st_folium(construir_mapa(gj, urls, modo == M_DESENHO), height=600, use_container_width=True,
-                    key=f"mapa{st.session_state['map_v']}", returned_objects=["last_clicked", "last_active_drawing"]) or {}
-    if modo == M_CLICK:
-        c = out.get("last_clicked")
-        if c and (c["lat"], c["lng"]) != st.session_state["ultimo_clique"]:
-            st.session_state["ultimo_clique"] = (c["lat"], c["lng"]); st.session_state["centro"] = (c["lat"], c["lng"]); st.rerun()
-    else:
-        dr = out.get("last_active_drawing")
-        if dr and json.dumps(dr["geometry"]) != gj:
-            st.session_state["gj_desenho"] = json.dumps(dr["geometry"]); st.rerun()
+    out = st_folium(construir_mapa(gj, urls), height=560, use_container_width=True,
+                    key=f"mapa{st.session_state['map_v']}", returned_objects=["last_active_drawing"])
+    d = (out or {}).get("last_active_drawing")
+    if d and json.dumps(d["geometry"]) != gj:
+        st.session_state["gj"] = json.dumps(d["geometry"]); st.rerun()
 
-with right, st.container(border=True):
-    html('<div class="passo"><b>1</b><span>Marque a sua terra</span></div>')
-    escolha("Como prefere marcar?", [M_CLICK, M_DESENHO], "modo", on_change=limpar)
-    if modo == M_CLICK:
-        st.selectbox("Tamanho aproximado", list(TAM), index=1, key="tam", help="1 hectare é mais ou menos um campo de futebol.")
-        st.caption("Clique no mapa, no meio da terra. Errou? Clique em outro ponto.")
-    else:
-        st.caption("Use o botão de polígono do mapa: clique nos cantos e termine no primeiro ponto. "
-                   "Errou no meio do desenho? Use Cancelar, no próprio mapa.")
-    st.button("Apagar e começar de novo", on_click=limpar, disabled=not gj)
+with right:
+    st.markdown("### 1️⃣ Marque sua terra")
+    st.write("No mapa, use os botões no canto esquerdo: **⬠ desenhar a área** (clique nos cantos e termine no primeiro ponto) "
+             "ou **▭ retângulo** (clique e arraste).")
     if not gj:
-        html('<p class="nota">Marque a sua terra no mapa para ver o que combina com ela.</p>')
+        st.info("👈 Desenhe sua área no mapa para continuar.")
         st.stop()
-    ha = area_ha(gj)
-    if ha > 5000:
-        html('<p class="nota">Essa área é muito grande (mais de 5.000 hectares). Marque só a sua terra.</p>'); st.stop()
-    html(f'<p class="mut">Terra marcada: cerca de {ha:,.0f} hectares.</p>'.replace(",", "."))
+    st.success("Área marcada! O mapa já centralizou nela.")
+    st.button("🗑️ Apagar área e recomeçar", on_click=limpar)
 
-    html('<div class="passo"><b>2</b><span>Conte um pouco sobre você</span></div>')
-    nivel = escolha("Você já plantou antes?", list(NIVEIS), "nivel")
-    irriga = escolha("Tem água para irrigar?", list(AGUA), "agua")
-    obj = escolha("O que você quer?", list(OBJ), "obj")
-    mes = st.selectbox("Quando pretende plantar?", list(range(1, 13)), index=TODAY.month - 1, key="mes",
-                       format_func=lambda m: MES[m - 1].capitalize() + (" (este mês)" if m == TODAY.month else ""))
-    ult_nome = st.selectbox("O que plantou por último nesta terra?", [NUNCA, PARADA] + [c["nome"] for c in CAT], key="ult")
+    st.markdown("### 2️⃣ Conte um pouco sobre você")
+    atual = st.selectbox("Hoje, na época da seca, depois da soja, você…", list(STRATS))
+    prior = st.radio("O que é mais importante para você?", list(PRIOR))
+    solo = st.selectbox("Como é o solo da sua terra?", list(zarc.SOLOS),
+                        help="Usado para consultar o ZARC (calendário oficial de plantio do Ministério da Agricultura). "
+                             "AD = água disponível no solo: AD1 segura pouca água, AD6 segura muita.")
 
-with st.spinner("Consultando os satélites… pode levar um minuto."):
-    d = coletar(gj)
-perfil = dict(nivel=NIVEIS[nivel], irriga=AGUA[irriga], obj=OBJ[obj], ha=ha)
-ultimo = POR_NOME.get(ult_nome)
-ok, motivos = ranking(d, perfil, mes, ultimo)
+# daqui para baixo os resultados usam a largura toda da página
+try:
+    with st.spinner("Olhando sua terra pelo satélite… (pode levar um minuto)"):
+        df, slope, ha = analyze(gj)
+except Exception as e:
+    st.error("Não consegui buscar os dados agora. Tente de novo ou desenhe uma área menor.")
+    with st.expander("Detalhe técnico do erro"):
+        st.code(str(e))
+    st.stop()
+if ha > 5000:
+    st.warning("Essa área é muito grande (mais de 5.000 hectares). Desenhe uma área menor."); st.stop()
+if ha < 6:
+    st.warning("Área pequena: os satélites têm pouco detalhe para ela. Use o resultado como uma indicação geral.")
 
-html(f'<h2 class="sec">O que combina com a sua terra em {MES[mes - 1]}</h2>')
-if not ok:
-    html('<p class="nota">Nada combina bem com a sua terra nesta época. ' + (
-        "Sem irrigação a chuva não é suficiente e várias culturas dessa época precisam de água. Tente outro mês ou veja se dá para irrigar."
-        if not perfil["irriga"] else "Tente outro mês.") + "</p>")
+# --- O satélite olha o que existe na área: dá para plantar? ---
+st.divider()
+st.markdown("### 🛰️ Dá para plantar nessa área?")
+try:
+    with st.spinner("Vendo o que existe na área (construções, água, mata)…"):
+        cob = cobertura(gj)
+except Exception as e:
+    cob = None
+    with st.expander("Não consegui identificar a cobertura da área (detalhe técnico)"):
+        st.code(str(e))
+apt = aptidao.avaliar(cob, slope, ha)
+va, vb = st.columns([3, 2], gap="large")
+with va:
+    lista = "\n".join(f"- {m}" for m in apt["motivos"])
+    if apt["nivel"] == "inapta":
+        st.error("**Esta área não parece própria para plantio.**\n\n" + lista, icon="🔴")
+    elif apt["nivel"] == "restricao":
+        mil = lambda v: f"{v:,.0f}".replace(",", ".")
+        st.warning(f"**Pode plantar, com cuidados.** Área plantável estimada: "
+                   f"**{mil(apt['util_ha'])} ha** de {mil(ha)} ha.\n\n" + lista, icon="🟡")
+    elif apt["nivel"] == "apta":
+        st.success(f"**Área apta para plantio.** O satélite viu lavoura, pasto ou campo em "
+                   f"{apt['frac_util']:.0%} da área, sem construções, água ou áreas protegidas relevantes.", icon="🟢")
+    else:
+        st.info(lista, icon="⚪")
+    st.caption("Fontes: Dynamic World (Sentinel-2, 10 m, últimos 6 meses), JRC Global Surface Water e WDPA. "
+               "O satélite pode confundir classes (ex.: pasto seco com solo exposto); confira no mapa pela camada "
+               "\"O que tem na área\".")
+with vb:
+    if cob and not cob.get("sem_dado"):
+        tab = pd.Series({aptidao.NOMES[k]: v * 100 for k, v in cob["cobertura"].items() if v >= 0.005}).sort_values()
+        st.bar_chart(tab, horizontal=True, height=220, x_label="% da área")
+        st.markdown("Cores da camada no mapa: " + " ".join(
+            f"<span style='color:#{c}'>■</span> {aptidao.NOMES[k]}" for k, c in zip(aptidao.DW_CLASSES[:8], aptidao.DW_PALETA)),
+            unsafe_allow_html=True)
+if apt["nivel"] == "inapta" and not st.checkbox("Mostrar a sugestão de rotação mesmo assim (sei que a área é plantável)"):
+    st.stop()
+
+ndvi = df["NDVI"]
+rain_am = df["Chuva (mm)"][[i for i in df.index if i[5:] in ("04", "05")]].dropna()
+anom = (ndvi - df["NDVI médio 2015-2024"]).tail(3).mean()
+ev = {"slope": slope, "bare": int((ndvi < 0.3).sum()), "anom": None if pd.isna(anom) else float(anom),
+      "rain_am": rain_am.sum() if len(rain_am) == 2 else None}
+
+# El Niño / La Niña + ZARC Brasília
+ev["enso"] = enso_atual()
+zdf = zarc_base()
+ev["zarc_tol"] = zarc.tolerancia(ev["enso"])
+safra = zarc.safras(zdf)[0] if zdf is not None else None
+if zdf is not None:
+    ev["zarc"] = {
+        SAFRINHA: zarc.combinar_soja_milho(zdf, solo, safra, "Milho 2ª Safra", ev["zarc_tol"]),
+        "Soja e depois milho com capim (braquiária)":
+            zarc.combinar_soja_milho(zdf, solo, safra, "Milho 2ª Safra consorciado com Braquiária", ev["zarc_tol"]),
+    }
+
+st.divider()
+st.markdown(f"### 3️⃣ O que vemos na sua terra ({ha:,.0f} hectares)".replace(",", "."))
+c1, c2, c3 = st.columns(3)
+c4, c5, c6 = st.columns(3)  # 2 linhas de 3: em 6 colunas os textos ficam cortados
+c1.metric("Vegetação agora", "sem dado" if ev["anom"] is None else
+          f"{farol(ev['anom'], -0.05, -0.10)} " + ("Normal" if ev["anom"] >= -0.05 else "Abaixo do normal" if ev["anom"] >= -0.10 else "Bem fraca"))
+c2.metric("Terra sem plantas", f"{farol(ev['bare'], 1, 3, False)} {ev['bare']} meses/ano")
+c3.metric("Terreno", "sem dado" if slope is None else f"{farol(slope, 3, 6, False)} " + ("Plano" if slope <= 3 else "Inclinado" if slope <= 6 else "Muito inclinado"))
+c4.metric("Chuva abril+maio", "sem dado" if ev["rain_am"] is None else
+          f"{farol(ev['rain_am'], 200, 150)} {ev['rain_am']:.0f} mm")
+en = ev["enso"]
+icone = "⚪" if en is None else {"El Niño": "🔴", "La Niña": "🔵", "Neutro": "🟢"}[en["fase"]]
+c5.metric("Pacífico (El Niño / La Niña)", f"{icone} {enso.rotulo(en)}",
+          None if en is None else f"ONI {en['oni']:+.2f} °C ({en['trimestre']})", delta_color="off")
+zs = (ev.get("zarc") or {}).get(SAFRINHA)
+c6.metric("ZARC: soja + milho safrinha", "sem dado" if zs is None else
+          ("🟢 Cabe no calendário" if zs else "🔴 Fora do calendário"),
+          f"risco aceito até {ev['zarc_tol']}%", delta_color="off")
+if not dentro_df(gj):
+    st.warning("Sua área parece estar fora do DF. O ZARC mostrado é o de Brasília; confira o do seu município.")
+
+st.divider()
+rank, notes = score(ev, PRIOR[prior], atual)
+pts = {r["nome"]: r["pontos"] for r in rank}
+top = rank[0]["nome"]
+st.markdown("## ✅ Nossa sugestão")
+if top == atual:
+    st.success(f"**Continue com: {top}.** Para o que você prioriza, sua rotação atual já é a mais indicada.")
 else:
-    html(destaque(ok[0], mes))
-    if len(ok) > 1:
-        html("<div>" + "".join(linha(r) for r in ok[1:4]) + "</div>")
-    if len(ok) > 4:
-        html('<p class="mut">Também possível: ' + esc(", ".join(r["nome"] for r in ok[4:7])) + ".</p>")
+    st.success(f"**Mudar para: {top}.**  \n(Hoje: {atual})")
+st.caption(f"Nota para o que você prioriza: {pts[top]}/100 · sua rotação atual: {pts[atual]}/100")
+a, b = st.columns(2)
+with a:
+    st.markdown("**Por que?**")
+    st.markdown(f"- {STRATS[top]['bom']}")
+    for n in notes:
+        st.markdown(f"- {n}")
+with b:
+    st.markdown("**Cuidados**")
+    st.markdown(f"- {STRATS[top]['risco']}")
+    st.markdown("**Outras opções**")
+    for r in rank[1:]:
+        dif = r["pontos"] - pts[atual]
+        extra = " _(a que você faz hoje)_" if r["nome"] == atual else f" _({dif:+d} pontos em relação a hoje)_"
+        st.markdown(f"{'⭐' * max(round(r['pontos'] / 20), 1)} {r['nome']}{extra}")
+st.info("💡 Esta é uma ajuda para pensar, não uma receita. Não consideramos análise do seu solo, preços, máquinas e custos. "
+        "Converse com um agrônomo ou com a Emater-DF antes de decidir.")
 
-html('<h2 class="sec">E depois? Um plano de rotação</h2>')
-seq = plano(d, perfil, mes, ultimo)
-html('<ol class="trilha">' + "".join(
-    f'<li><time>{MES[mm - 1]}</time><b>{esc(r["nome"])}</b><span>{esc(r["bom"][0] if r["bom"] else r["desc"])}</span>'
-    + (f"<em>A terra descansa {e} mês(es) antes.</em>" if e else "") + "</li>" for mm, r, e in seq) + "</ol>")
-html('<p class="mut">A ideia é alternar famílias de plantas e incluir uma que devolve nitrogênio ao solo (feijão, crotalária), '
-     'para cuidar da terra e interromper pragas e doenças.</p>')
+st.markdown("## 🌦️ Clima do ano e calendário oficial de plantio (Brasília/DF)")
+ce, cz = st.columns([2, 3], gap="large")
+with ce:
+    st.markdown("**El Niño / La Niña agora**")
+    if en is None:
+        st.info("Não consegui buscar o índice da NOAA agora. Tente de novo mais tarde.")
+    else:
+        st.markdown(f"### {icone} {enso.rotulo(en)}")
+        tend = "esquentando" if en["tendencia"] > 0.2 else "esfriando" if en["tendencia"] < -0.2 else "estável"
+        st.caption(f"ONI {en['oni']:+.2f} °C no trimestre {en['trimestre']} · {en['seq']} trimestre(s) seguidos "
+                   f"além de ±0,5 °C · tendência: {tend}")
+        st.write(en["impacto"])
+        _cm = {s: i + 1 for i, s in enumerate(["DJF", "JFM", "FMA", "MAM", "AMJ", "MJJ", "JJA", "JAS", "ASO", "SON", "OND", "NDJ"])}
+        hist = pd.DataFrame({"ONI (°C)": [v for _, _, v in en["historico"]]},
+                            index=pd.to_datetime([f"{a}-{_cm[s]:02d}-01" for s, a, _ in en["historico"]]))
+        hist["El Niño (+0,5)"], hist["La Niña (−0,5)"] = 0.5, -0.5
+        st.line_chart(hist, height=200)
+        st.caption("Fonte: NOAA/CPC, Oceanic Niño Index (região Niño 3.4).")
+with cz:
+    st.markdown("**ZARC: quando plantar com menor risco**")
+    if zdf is None:
+        st.info("Base do ZARC não encontrada. Rode `python scripts/atualizar_zarc.py` para baixá-la.")
+    else:
+        st.caption(f"Safra {safra}/{int(safra) + 1} · solo: {solo} · sequeiro. Números = chance de perda (%) "
+                   f"se plantar naquele decêndio; vazio = fora do zoneamento. Neste ano aceitamos até **{ev['zarc_tol']}%**"
+                   + (" por causa do El Niño." if ev["zarc_tol"] == 20 else "."))
+        cal = zarc.calendario(zdf, solo, safra, ["Soja", "Milho 2ª Safra", "Milho 2ª Safra consorciado com Braquiária",
+                                                  "Sorgo Granífero 2ª Safra", "Feijão 2ª Safra", "Milho 1ª Safra"])
+        cal = cal.loc[:, (cal > 0).any()]  # só os decêndios com alguma indicação
+        tol = ev["zarc_tol"]
+        cor = lambda v: ("" if v == 0 else "background-color:#1a9850;color:white" if v <= 20 else
+                         "background-color:#fee08b" if v <= tol else "background-color:#f4a582")
+        st.dataframe(cal.style.map(cor).format(lambda v: f"{v}%" if v else ""), width="stretch")
+        for nome, combos in ev["zarc"].items():
+            if combos:
+                c = combos[0]
+                st.markdown(f"✅ **{nome}**: plante soja **{c['soja_ciclo']}** em **{zarc.nome_dec(c['soja_dec'])}** "
+                            f"(risco {c['soja_risco']}%) → colheita e 2ª safra por volta de **{zarc.nome_dec(c['milho_dec'])}** "
+                            f"(risco {c['milho_risco']}%).")
+            else:
+                st.markdown(f"⚠️ **{nome}**: sem combinação soja → 2ª safra dentro de {tol}% de risco neste solo.")
+        st.caption("Fonte: MAPA, Tábua de Risco do ZARC (dados abertos). A data de colheita da soja é estimada pelo "
+                   "grupo (≈100/120/130 dias); confira o ciclo da sua cultivar. Plantas de cobertura (milheto, "
+                   "crotalária) não têm ZARC próprio.")
 
-html('<h2 class="sec">O que sabemos sobre a sua terra</h2>')
-cj, t, s, veg = clima_janela(d.get("clima"), mes, 4), d.get("terreno"), d.get("solo"), d.get("veg")
-nasa = "NASA POWER, vale para a região"
-html('<dl class="dados">' + "".join([
-    dado("Temperatura nos próximos meses", cj and f"{cj['t']:.0f} °C em média", nasa),
-    dado("Chuva esperada em 4 meses", cj and f"{cj['chuva']:.0f} mm", nasa),
-    dado("Umidade do ar", cj and cj["ur"] is not None and f"{cj['ur']:.0f}%", nasa),
-    dado("Altitude", t and f"{t['alt']:.0f} m", "NASA SRTM, 30 metros"),
-    dado("Terreno", t and ("Plano" if t["decl"] <= 3 else "Inclinado" if t["decl"] <= 6 else "Muito inclinado"), "NASA SRTM, 30 metros"),
-    dado("Umidade do solo agora", s and ("Bem mais seca que o normal" if s["pct"] < 0.25 else "Um pouco mais seca que o normal"
-         if s["pct"] < 0.4 else "Normal" if s["pct"] <= 0.6 else "Mais úmida que o normal"), "NASA GLDAS, vale para a região"),
-    dado("Meses com pouca planta no último ano", veg is not None and f"{int((veg < 0.3).sum())} de 12", "NASA MODIS, 250 metros")]) + "</dl>")
-conf = confianca(d)
-html(f'<p class="nota"><b>Confiança da sugestão: {conf}.</b> ' + {"alta": "Conseguimos todos os dados.",
-     "média": "Faltou algum dado; veja os itens marcados como sem dado.",
-     "baixa": "Faltaram dados importantes, como o clima. Use só como ideia inicial."}[conf] +
-     "<br><b>O que não sabemos:</b> o tipo e a fertilidade do solo, o preço de venda, o que já foi plantado aí e a sua estrutura "
-     "(máquinas, mão de obra). Clima e umidade do solo valem para a região, não só para a sua terra. "
-     "Converse com um agrônomo ou com a Emater-DF antes de decidir.</p>")
-
-with st.expander("Parecer técnico (para quem entende do assunto)"):
-    fontes = [("Clima (T2M, chuva, UR)", d.get("clima"), "NASA POWER, média mensal 2015–" + str(TODAY.year - 1) + ", ~50 km"),
-              ("Altitude e declive", d.get("terreno"), "NASA SRTM, 30 m"),
-              ("Umidade do solo 0–10 cm", d.get("solo"), "NASA GLDAS 2.1 Noah, 0,25°; percentil do mês vs. 2010–hoje"),
-              ("NDVI mensal", d.get("veg"), "NASA MODIS MOD13Q1, 250 m (últimos 12 meses)"),
-              ("Radar VH com filtro Lee", d.get("radar"), "Sentinel-1 GRD (ESA), 30 m, Lee 5×5, ENL 4,4")]
-    st.dataframe(pd.DataFrame([{"Dado": n, "Disponível": "sim" if v is not None else "NÃO", "Fonte / resolução": f} for n, v, f in fontes]),
-                 hide_index=True, width="stretch")
-    for k, e in d.get("erros", {}).items(): st.caption(f"Falha em '{k}': {e}")
-    if d.get("clima"):
-        st.markdown("**Clima mensal (média do período)**")
-        st.dataframe(pd.DataFrame([{"Mês": MES[m - 1], "T média (°C)": v["t"], "Chuva (mm)": v["chuva"], "UR (%)": v["ur"]}
-                                   for m, v in d["clima"].items()]).round(1), hide_index=True, width="stretch")
-    if d.get("veg") is not None: st.markdown("**NDVI mensal (MODIS)**"); st.line_chart(d["veg"])
-    if d.get("radar") is not None: st.markdown("**Radar VH filtrado (dB)**"); st.line_chart(d["radar"])
-    st.markdown("**Método.** Ranking por regras (não é modelo treinado): janela de plantio, temperatura média e chuva do ciclo "
-                "(até 4 meses) contra a faixa da cultura; exigência de irrigação; dificuldade vs. experiência; área mínima; objetivo; "
-                "rotação (mesma família penaliza; leguminosa após não leguminosa e gramínea após leguminosa bonificam); declive > 6° favorece "
-                "culturas de cobertura; umidade do solo abaixo do percentil 30 (sem irrigação). NDVI e filtro Lee seguem os notebooks "
-                "NDVI/GEE_multiplas_datas e Lee_filter do curso. As faixas e janelas das culturas são referência agronômica geral e "
-                "precisam de validação (Emater-DF, Embrapa Hortaliças/Cerrados). Clima e solo têm resolução (25–50 km) maior que a terra.")
+with st.expander("📊 Ver detalhes técnicos (gráficos e dados)"):
+    st.caption("Dados: NASA MODIS (vegetação), NASA GPM (chuva), NASA SRTM (relevo) e radar Sentinel-1 da ESA com filtro Lee, "
+               "que enxerga através das nuvens. No mapa, use o ícone de camadas para ver o radar bruto e o filtrado.")
+    t1, t2 = st.columns(2)
+    t1.markdown("**Vegetação (NDVI): este ano vs. média 2015–2024**")
+    t1.line_chart(df[["NDVI", "NDVI médio 2015-2024"]])
+    t2.markdown("**Chuva mensal (mm)**")
+    t2.bar_chart(df["Chuva (mm)"])
+    st.markdown("**Radar VH filtrado (dB)**: queda forte pode indicar colheita ou solo exposto")
+    st.line_chart(df["Radar VH filtrado (dB)"])
