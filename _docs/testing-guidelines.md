@@ -26,7 +26,12 @@ rodam ele inteiro com `streamlit.testing.v1.AppTest` (fixture `app` em `tests/co
   antes do `import ee` do app. Cada expressão guarda de quais coleções veio, e o `.getInfo()` responde pelo id da coleção
   (`fake_ee.respostas["S1_GRD"]`, `"MOD13Q1"`, `"FLDAS"`, `"SRTMGL1"`). Para simular falha, troque a resposta por uma
   função que levanta exceção. `fake_ee.chamadas` conta as consultas de cada coleção. Para simular o Earth Engine
-  fora do ar (`EE_OK` falso), defina `fake_ee.init_erro` antes de rodar o app.
+  fora do ar (`EE_OK` falso), defina `fake_ee.init_erro` antes de rodar o app (ou uma função, ex.: uma que trava, para
+  simular a rede sem resposta). `fake_ee.inits` conta as chamadas a `ee.Initialize`.
+- **Inicialização do Earth Engine** (#19): `init_ee` guarda o resultado num `st.cache_resource` (um por processo). Uma
+  falha vale 120 s (`EE_PAUSA`) para todas as sessões, medidos com `time.monotonic` (fixture `relogio_fontes`). O prazo
+  de 30 s (`EE_PRAZO`) é o `timeout` do `Future.result`; os testes encurtam esse prazo trocando
+  `concurrent.futures.Future.result` (fixture `rede_travada` em `tests/test_init_ee.py`).
   Se o app passar a usar uma coleção nova, acrescente a resposta em `FakeEE.respostas`.
   Uma resposta que recebe um argumento ganha a linhagem; `fake_ee.geometria(lin)` devolve o GeoJSON da terra
   consultada (para responder conforme o ponto). `fake_ee.threads` guarda em qual thread cada coleção foi consultada.

@@ -4,8 +4,8 @@ Rodar: earthengine authenticate ; streamlit run app.py   (.env: GEE_PROJECT=seu-
 """
 from dotenv import load_dotenv
 load_dotenv()
-import os, json, math, datetime as dt
-from concurrent.futures import ThreadPoolExecutor
+import os, json, math, threading, datetime as dt
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from time import monotonic
 import ee, folium, pandas as pd, requests, streamlit as st
 from folium.plugins import Draw
@@ -13,13 +13,36 @@ from streamlit_folium import st_folium
 
 st.set_page_config(page_title="RotaDF", layout="wide", initial_sidebar_state="collapsed")
 
-@st.cache_resource
+EE_PRAZO, EE_PAUSA = 30, 120  # s: desiste do Initialize; não tenta de novo depois de uma falha (#19)
+
+@st.cache_resource(show_spinner=False)
+def _estado_ee():
+    """Um por processo: o `cache_resource` não guarda exceções, então a falha fica aqui e não refaz o init a cada rerun."""
+    return {"ok": False, "erro": "", "falhou": None, "tentativa": None, "trava": threading.Lock()}
+
 def init_ee():
-    ee.Initialize(project=os.environ.get("GEE_PROJECT"))
-try:
-    init_ee(); EE_OK, EE_ERRO = True, ""
-except Exception as _e:
-    EE_OK, EE_ERRO = False, str(_e)[:300]
+    """Inicializa o Earth Engine uma vez por processo. Falha vale EE_PAUSA s para todas as sessões; o Initialize roda
+    numa thread para desistir em EE_PRAZO s no total (o `setDeadline` não vale antes do Initialize e é por requisição,
+    multiplicado pelas retentativas). Uma tentativa ainda presa não é repetida."""
+    e = _estado_ee()
+    with e["trava"]:
+        pausa = e["falhou"] is not None and monotonic() - e["falhou"] < EE_PAUSA
+        presa = e["tentativa"] is not None and not e["tentativa"].done()
+        if e["ok"] or pausa or presa:
+            return e["ok"], e["erro"]
+        with st.spinner("Conectando ao Earth Engine…"):
+            ex = ThreadPoolExecutor(max_workers=1)
+            e["tentativa"] = ex.submit(ee.Initialize, project=os.environ.get("GEE_PROJECT"))
+            ex.shutdown(wait=False)
+            try:
+                e["tentativa"].result(timeout=EE_PRAZO)
+                e.update(ok=True, erro="", falhou=None)
+            except FuturesTimeout:
+                e.update(erro=f"Earth Engine não respondeu em {EE_PRAZO} s", falhou=monotonic())
+            except Exception as _e:
+                e.update(erro=str(_e)[:300], falhou=monotonic())
+    return e["ok"], e["erro"]
+EE_OK, EE_ERRO = init_ee()
 
 TODAY = dt.date.today()
 REFERENCIA = TODAY.replace(day=1).isoformat()  # cache mensal; janela de 12 meses termina no mês passado
