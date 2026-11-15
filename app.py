@@ -341,14 +341,15 @@ def avaliar(c, d, p, mes, ultimo):
     if s and not p["irriga"] and s["pct"] < 0.3:
         if c["agua"] == "baixa": pts += 8; bom.append("Aguenta bem o solo mais seco que o normal na região.")
         elif c["agua"] == "alta": pts -= 8; cuid.append("O solo da região está mais seco que o normal.")
-    return dict(c, pts=max(0, min(100, round(pts))), bom=bom, cuid=cuid)
+    # O teto serve à barra visual; ordenar por ele apagaria diferenças ambientais acima de 100.
+    return dict(c, adequacao=pts, pts=max(0, min(100, round(pts))), bom=bom, cuid=cuid)
 
 NOTA_MIN = 50
 
 def ranking(d, p, mes, ultimo):
     rs = [avaliar(c, d, p, mes, ultimo) for c in CAT]
     ok = [r for r in rs if isinstance(r, dict) and r["pts"] >= NOTA_MIN]  # abaixo disso não vale recomendar
-    return sorted(ok, key=lambda r: -r["pts"]), [r for r in rs if isinstance(r, str)]
+    return sorted(ok, key=lambda r: -r["adequacao"]), [r for r in rs if isinstance(r, str)]
 
 def plano(d, p, mes, ultimo, passos=3):
     """Sequência de plantios (rotação): cada passo escolhe a melhor cultura depois do ciclo da anterior."""
@@ -600,7 +601,7 @@ def destaque(r, mes):
     rot = "Combina muito com a sua terra" if r["pts"] >= 70 else "Combina com a sua terra"
     return ('<section class="destaque">' f'<h3>Plantar {esc(r["nome"])} em {MES[mes - 1]}</h3><p>{esc(r["desc"])}</p>'
             f'{barra(r["pts"])}<small>{rot}</small><div class="duas">'
-            f'<div><h5>Por que combina</h5><ul>{lis(r["bom"][:4] or ["Sem pontos fortes com os dados que temos."], "ok")}</ul></div>'
+            f'<div><h5>Por que combina</h5><ul>{lis(r["bom"] or ["Sem pontos fortes com os dados que temos."], "ok")}</ul></div>'
             f'<div><h5>Pontos de atenção</h5><ul>{lis(r["cuid"][:4] or ["Nenhum alerta com os dados que temos."], "nd")}</ul></div></div></section>')
 
 def linha(r):
