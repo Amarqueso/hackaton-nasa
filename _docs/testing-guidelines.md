@@ -28,10 +28,19 @@ rodam ele inteiro com `streamlit.testing.v1.AppTest` (fixture `app` em `tests/co
   função que levanta exceção. `fake_ee.chamadas` conta as consultas de cada coleção. Para simular o Earth Engine
   fora do ar (`EE_OK` falso), defina `fake_ee.init_erro` antes de rodar o app (ou uma função, ex.: uma que trava, para
   simular a rede sem resposta). `fake_ee.inits` conta as chamadas a `ee.Initialize`.
-- **Inicialização do Earth Engine** (#19): `init_ee` guarda o resultado num `st.cache_resource` (um por processo). Uma
-  falha vale 120 s (`EE_PAUSA`) para todas as sessões, medidos com `time.monotonic` (fixture `relogio_fontes`). O prazo
-  de 30 s (`EE_PRAZO`) é o `timeout` do `Future.result`; os testes encurtam esse prazo trocando
-  `concurrent.futures.Future.result` (fixture `rede_travada` em `tests/test_init_ee.py`).
+- **Inicialização do Earth Engine** (#19, #20): `iniciar_ee` começa o `Initialize` em segundo plano no topo do script e
+  `estado_ee()` espera por ele só onde um dado do EE é necessário (`coletar`, camadas, radar). O estado fica num
+  `st.cache_resource` (um por processo). Com o `Initialize` falso instantâneo, ele já terminou quando alguém pergunta;
+  para ver a espera (o aviso "Conectando ao Earth Engine…" ou a ordem mapa → espera), use a fixture `init_lento`, que
+  só solta quando o teste manda (`soltar_em(0.3)`). Uma falha vale 120 s (`EE_PAUSA`) para todas as sessões, medidos
+  com `time.monotonic` (fixture `relogio_fontes`). O prazo de 30 s (`EE_PRAZO`, contado desde o início da tentativa) é
+  o `timeout` do `Future.result`; a fixture `rede_travada` registra os prazos pedidos e encurta a espera de verdade
+  (`tests/test_init_ee.py`).
+- **Discovery do Earth Engine** (#22): `instalar_cache_discovery` troca `googleapiclient.discovery._retrieve_discovery_doc`
+  por um hook com cache em memória e em `$ROTADF_CACHE/ee_discovery.json` (24 h). A troca é global no processo e o hook
+  não é instalado duas vezes; a fixture `baixar` (`tests/test_discovery.py`) põe um falso no lugar do original, que conta
+  os downloads, aponta `ROTADF_CACHE` para uma pasta temporária e, com `baixar.reiniciar()`, simula um processo novo
+  (memória vazia, disco fica). `test_assinatura_real_do_googleapiclient` avisa se o `googleapiclient` mudar a função.
   Se o app passar a usar uma coleção nova, acrescente a resposta em `FakeEE.respostas`.
   Uma resposta que recebe um argumento ganha a linhagem; `fake_ee.geometria(lin)` devolve o GeoJSON da terra
   consultada (para responder conforme o ponto). `fake_ee.threads` guarda em qual thread cada coleção foi consultada.
