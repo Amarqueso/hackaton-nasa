@@ -1,4 +1,6 @@
 """Issue #3: a umidade do solo vem do FLDAS mensal, numa única consulta, com o percentil calculado em Python."""
+import datetime as dt
+
 import pytest
 
 from fake_ee import SEM_V, serie_mensal
@@ -132,3 +134,16 @@ def test_mes_de_referencia_nao_muda_a_recomendacao(app):
     depois = [t for t in app.recomendacao() if 'class="dados"' not in t]
     assert dados(app)[LINHA] == "Normal (novembro de 2026)"
     assert antes == depois
+
+
+@pytest.mark.parametrize("mes_atual", [1, 2])
+def test_inicio_do_ano_mostra_o_ano_do_dado_e_nao_o_atual(app, monkeypatch, mes_atual):
+    class DataFixa(dt.date):
+        @classmethod
+        def today(cls):
+            return cls(2027, mes_atual, 15)
+
+    monkeypatch.setattr(dt, "date", DataFixa)
+    solo(app, lambda a, m: 0.5 if a == 2026 else (0.4 if a % 2 else 0.6), ate=(2026, 12))
+    app.marcar_terra()
+    assert dados(app)[LINHA] == "Normal (dezembro de 2026)"
