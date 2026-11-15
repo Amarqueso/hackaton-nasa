@@ -28,6 +28,10 @@ rodam ele inteiro com `streamlit.testing.v1.AppTest` (fixture `app` em `tests/co
   função que levanta exceção. `fake_ee.chamadas` conta as consultas de cada coleção. Para simular o Earth Engine
   fora do ar (`EE_OK` falso), defina `fake_ee.init_erro` antes de rodar o app.
   Se o app passar a usar uma coleção nova, acrescente a resposta em `FakeEE.respostas`.
+  Uma resposta que recebe um argumento ganha a linhagem; `fake_ee.geometria(lin)` devolve o GeoJSON da terra
+  consultada (para responder conforme o ponto). `fake_ee.threads` guarda em qual thread cada coleção foi consultada.
+- **Threads**: `coletar` consulta POWER e Earth Engine ao mesmo tempo. Para provar que é em paralelo, as respostas
+  falsas esperam numa `threading.Barrier` (ver `tests/test_coletar.py`): se fosse uma de cada vez, a barreira estouraria.
 - **NASA POWER**: `requests.get` é trocado por um `mock` com um JSON mínimo (`resposta_power`); `app.get.call_count`
   conta as consultas.
 - **Spinners**: `streamlit.spinner` é envolvido para registrar os textos em `app.spinners`. O spinner do Streamlit só
