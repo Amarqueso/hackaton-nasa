@@ -24,7 +24,7 @@ rodam ele inteiro com `streamlit.testing.v1.AppTest` (fixture `app` em `tests/co
 
 - **Earth Engine**: `tests/fake_ee.py` é um módulo `ee` falso colocado em `sys.modules["ee"]` (fixture `fake_ee`),
   antes do `import ee` do app. Cada expressão guarda de quais coleções veio, e o `.getInfo()` responde pelo id da coleção
-  (`fake_ee.respostas["S1_GRD"]`, `"MOD13Q1"`, `"GLDAS"`, `"SRTMGL1"`). Para simular falha, troque a resposta por uma
+  (`fake_ee.respostas["S1_GRD"]`, `"MOD13Q1"`, `"FLDAS"`, `"SRTMGL1"`). Para simular falha, troque a resposta por uma
   função que levanta exceção. `fake_ee.chamadas` conta as consultas de cada coleção. Para simular o Earth Engine
   fora do ar (`EE_OK` falso), defina `fake_ee.init_erro` antes de rodar o app.
   Se o app passar a usar uma coleção nova, acrescente a resposta em `FakeEE.respostas`.

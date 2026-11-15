@@ -22,6 +22,26 @@ def serie(valores):
     return {"features": [{"properties": {"m": m, "v": v}} for m, v in zip(MESES, valores)]}
 
 
+def serie_mensal(valor, ate=(2026, 9), de=(2010, 1)):
+    """Resposta da umidade do solo (FLDAS): uma Feature por imagem mensal, com 'm' (YYYY-MM) e 'v'.
+    `valor(ano, mes)` devolve o valor, None (pixel mascarado: 'v' nulo) ou `SEM_V` (Feature sem 'v')."""
+    feats, (a, m) = [], de
+    while (a, m) <= ate:
+        v = valor(a, m)
+        props = {"m": f"{a}-{m:02d}"} if v is SEM_V else {"m": f"{a}-{m:02d}", "v": v}
+        feats.append({"type": "Feature", "geometry": None, "properties": props})
+        a, m = (a + 1, 1) if m == 12 else (a, m + 1)
+    return {"type": "FeatureCollection", "features": feats}
+
+
+SEM_V = object()
+
+
+def _solo_padrao(a, m):
+    """O último mês (2026-09) fica no meio dos anos anteriores: classe "Normal"."""
+    return 0.20 + 0.01 * (a - 2010 if a < 2026 else 7.5)
+
+
 def _pede_argumento(fn):
     return any(p.default is p.empty for p in inspect.signature(fn).parameters.values())
 
@@ -73,7 +93,7 @@ class FakeEE(types.ModuleType):
         self._trava = threading.Lock()
         self.respostas = {
             "SRTMGL1": lambda: {"elevation": 1100.0, "slope": 2.0},
-            "GLDAS": lambda: serie([20.0 + i for i in range(12)]),
+            "FLDAS": lambda: serie_mensal(_solo_padrao),
             "MOD13Q1": lambda: serie([5000.0] * 12),
             "S1_GRD": lambda: serie([-15.0 + 0.1 * i for i in range(12)]),
         }

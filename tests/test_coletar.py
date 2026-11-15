@@ -9,7 +9,7 @@ import requests
 from fake_ee import geometria
 
 CONSULTANDO = "Consultando os satélites… pode levar um minuto."
-EE = ("SRTMGL1", "GLDAS", "MOD13Q1")  # terreno, solo, NDVI
+EE = ("SRTMGL1", "FLDAS", "MOD13Q1")  # terreno, solo, NDVI
 SEM_DADO = 'class="falta">Sem dado'
 
 
@@ -28,7 +28,7 @@ def esperar_todas(app, n=4, timeout=5):
         resp, feito = app.ee.respostas[k], []
 
         def r(resp=resp, feito=feito):
-            if not feito:  # o GLDAS é consultado duas vezes; só a primeira espera
+            if not feito:  # só a primeira consulta de cada coleção espera
                 feito.append(1)
                 barreira.wait()
             return resp()
@@ -90,7 +90,7 @@ def test_threads_nao_geram_aviso_de_script_run_context(app, avisos_streamlit):
 def test_resultado_tem_o_mesmo_formato_e_aparece_na_tela(app):
     app.marcar_terra()
     assert app.get.call_count == 1
-    assert {k: app.ee.chamadas[k] for k in EE} == {"SRTMGL1": 1, "GLDAS": 2, "MOD13Q1": 1}
+    assert {k: app.ee.chamadas[k] for k in EE} == {"SRTMGL1": 1, "FLDAS": 1, "MOD13Q1": 1}
     tela = dados(app)
     assert None not in tela.values(), tela
     assert tela["Altitude"] == "1100 m"

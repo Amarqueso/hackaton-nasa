@@ -4,7 +4,7 @@ import pytest
 RADAR = "Radar VH com filtro Lee"
 CARREGANDO_RADAR = "Carregando o radar…"
 CONSULTANDO = "Consultando os satélites… pode levar um minuto."
-OUTRAS = ("SRTMGL1", "GLDAS", "MOD13Q1")  # terreno, solo, NDVI
+OUTRAS = ("SRTMGL1", "FLDAS", "MOD13Q1")  # terreno, solo, NDVI
 
 
 def consultas_sem_radar(app):
