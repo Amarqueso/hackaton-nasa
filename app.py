@@ -9,7 +9,7 @@ import ee, folium, pandas as pd, requests, streamlit as st
 from folium.plugins import Draw
 from streamlit_folium import st_folium
 
-st.set_page_config(page_title="RotaDF", page_icon="🌱", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="RotaDF", layout="wide", initial_sidebar_state="collapsed")
 
 @st.cache_resource
 def init_ee():
@@ -76,9 +76,9 @@ _C = [
 CAT = [dict(zip(K, r)) for r in _C]
 POR_NOME = {c["nome"]: c for c in CAT}
 
-NIVEIS = {"🌱 Nunca plantei": 1, "🧑‍🌾 Já planto há algum tempo": 2, "⭐ Tenho muita experiência": 3}
-AGUA = {"Só tenho a chuva": False, "Tenho água para irrigar": True}
-OBJ = {"💰 Vender e ter renda": "renda", "🍽️ Alimentar a família": "comida", "🌿 Cuidar e melhorar a terra": "terra"}
+NIVEIS = {"Nunca plantei": 1, "Já planto": 2, "Tenho experiência": 3}
+AGUA = {"Só chuva": False, "Posso irrigar": True}
+OBJ = {"Renda": "renda", "Alimentação": "comida", "Cuidar da terra": "terra"}
 TAM = {"Pequena (cerca de 2 hectares)": 2, "Média (cerca de 10 hectares)": 10,
        "Grande (cerca de 50 hectares)": 50, "Muito grande (cerca de 200 hectares)": 200}
 NUNCA, PARADA = "Nunca plantei / não sei", "Terra parada (nada)"
@@ -185,7 +185,7 @@ def avaliar(c, d, p, mes, ultimo):
             else:
                 pts -= 40; cuid.append(f"Deve chover pouco ({cj['chuva']:.0f} mm) para ela sem irrigação.")
     else:
-        cuid.append("❓ Sem dado de clima agora: não deu para conferir se o tempo combina.")
+        cuid.append("Sem dado de clima agora: não deu para conferir se o tempo combina.")
     if c["dif"] > p["nivel"]:
         pts -= 20 * (c["dif"] - p["nivel"]); cuid.append("Pede mais experiência: vale buscar apoio da Emater-DF.")
     elif p["nivel"] == 1 and c["dif"] == 1:
@@ -295,7 +295,7 @@ class _LimitarMapa(MacroElement):
         self.sul, self.oeste, self.norte, self.leste, self.zmin = b["min_lat"], b["min_lon"], b["max_lat"], b["max_lon"], zmin
 
 ZOOM_MIN = 9
-COR = "#ff5a1f"
+COR = "#F5B700"  # amarelo de ipê: contrasta com o satélite e com o mapa
 
 def construir_mapa(gj, urls, desenho):
     # obs.: com tiles=None o folium ignora min_zoom/max_zoom; os limites de zoom são aplicados em _LimitarMapa
@@ -325,7 +325,69 @@ def construir_mapa(gj, urls, desenho):
 # --- FIM MAPA ---
 
 # ---------------- Interface ----------------
-M_CLICK, M_DESENHO = "📍 Clicar no meio da terra", "✏️ Desenhar o contorno"
+import html as _h
+CSS = """
+@import url('https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Public+Sans:wght@400;500;600&display=swap');
+:root{--bg:#F2F4F1;--papel:#fff;--tinta:#16241D;--verde:#1D4D3B;--verde-cl:#DDE8E0;--ipe:#E8B000;--terra:#9C4A2F;--linha:#D9DFDA;--mut:#5F6B64}
+.stApp{background:var(--bg);color:var(--tinta)}
+.stApp,.stMarkdown,.stMarkdown p,label,button,input,[data-baseweb]{font-family:'Public Sans',system-ui,sans-serif}
+.block-container{max-width:1280px;padding:1.2rem 1.5rem 4rem}
+header[data-testid="stHeader"]{background:transparent}
+#MainMenu,footer{visibility:hidden}
+h1,h2,h3,h4,h5,.marca,.passo span,.trilha b{font-family:'Bricolage Grotesque',system-ui,sans-serif;color:var(--verde);letter-spacing:-.015em}
+.topo{display:flex;flex-wrap:wrap;align-items:baseline;gap:.3rem 1.2rem;padding:.2rem 0 1rem;border-bottom:1px solid var(--linha);margin-bottom:1.2rem}
+.marca{font-size:1.5rem;font-weight:700;display:inline-flex;align-items:center;gap:.5rem}
+.marca::before{content:"";width:.8rem;height:.8rem;border-radius:50%;background:var(--ipe)}
+.lema{color:var(--mut)}
+iframe[title*="folium"]{border:1px solid var(--linha);border-radius:12px;height:clamp(400px,68vh,700px)!important;background:#dfe6e0}
+[data-testid="stVerticalBlockBorderWrapper"]{border-color:var(--linha)!important;border-radius:12px;background:var(--papel)}
+[data-testid="stExpander"]{border:1px solid var(--linha);border-radius:12px;background:var(--papel)}
+[data-testid="stWidgetLabel"] p{font-size:.86rem;color:var(--mut);font-weight:500}
+.stButton button{border-radius:8px;border:1px solid var(--verde);color:var(--verde);background:transparent}
+.stButton button:hover{background:var(--verde-cl);border-color:var(--verde);color:var(--verde)}
+.passo{display:flex;align-items:center;gap:.6rem;margin:.3rem 0 .6rem}
+.passo b{width:1.6rem;height:1.6rem;border-radius:50%;background:var(--verde);color:#fff;display:grid;place-items:center;font-size:.85rem}
+.passo span{font-weight:700;font-size:1.2rem}
+h2.sec{font-size:1.6rem;margin:2.4rem 0 .9rem;font-weight:700}
+.destaque{background:var(--verde);color:#fff;border-radius:14px;padding:1.6rem 1.7rem}
+.destaque h3{color:#fff;font-size:1.8rem;margin:0 0 .2rem;font-weight:700}
+.destaque p{margin:0 0 1rem;color:#CFE0D6}
+.destaque small{color:#CFE0D6;display:block;margin-top:.4rem}
+.destaque .fit{background:rgba(255,255,255,.22)}
+.destaque .fit i{background:var(--ipe)}
+.destaque h5{color:#fff;font-size:1.02rem;margin:.2rem 0 .4rem}
+.duas{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:1rem 2.2rem;margin-top:1.2rem}
+.destaque ul{list-style:none;padding:0;margin:0}
+.destaque li{position:relative;padding-left:1.1rem;margin:.4rem 0;font-size:.95rem;line-height:1.45}
+.destaque li::before{content:"";position:absolute;left:0;top:.55em;width:.5rem;height:.5rem;border-radius:50%;background:#fff;opacity:.5}
+.destaque li.ok::before{background:var(--ipe);opacity:1}
+.fit{display:block;height:6px;border-radius:3px;background:var(--verde-cl);overflow:hidden;min-width:90px}
+.fit i{display:block;height:100%;background:var(--verde);border-radius:3px}
+.linha{display:grid;grid-template-columns:minmax(0,1.3fr) 150px minmax(0,1.6fr);gap:1rem;align-items:center;padding:.95rem .2rem;border-bottom:1px solid var(--linha)}
+.linha b{display:block;font-weight:600}
+.linha div span{display:block;color:var(--mut);font-size:.88rem}
+.linha p{margin:0;font-size:.92rem}
+.trilha{list-style:none;margin:0;padding:0;display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr))}
+.trilha li{position:relative;padding:1.2rem 1.2rem 0 0}
+.trilha li::before{content:"";position:absolute;top:0;left:0;right:0;border-top:2px solid var(--linha)}
+.trilha li::after{content:"";position:absolute;top:-5px;left:0;width:10px;height:10px;border-radius:50%;background:var(--ipe)}
+.trilha time{display:block;text-transform:capitalize;color:var(--mut);font-size:.88rem}
+.trilha b{font-size:1.25rem;display:block;font-weight:700}
+.trilha span{display:block;font-size:.9rem;margin-top:.2rem}
+.trilha em{display:block;color:var(--terra);font-size:.85rem;font-style:normal;margin-top:.3rem}
+.dados{margin:0;border-top:1px solid var(--linha)}
+.dados>div{display:grid;grid-template-columns:minmax(150px,1fr) minmax(120px,1fr) minmax(0,1.6fr);gap:.3rem 1rem;padding:.75rem 0;border-bottom:1px solid var(--linha)}
+.dados dt{font-weight:600}.dados dd{margin:0}
+.dados .fonte{color:var(--mut);font-size:.88rem}
+.dados .falta{color:var(--terra);font-weight:600}
+.nota{border-left:3px solid var(--ipe);padding:.3rem 1rem;margin:1rem 0;line-height:1.55}
+.mut{color:var(--mut);font-size:.92rem}
+@media (max-width:720px){.block-container{padding:.8rem .9rem 3rem}.linha{grid-template-columns:1fr;gap:.4rem}
+.dados>div{grid-template-columns:1fr}.destaque{padding:1.2rem}.destaque h3{font-size:1.45rem}h2.sec{font-size:1.35rem}}
+"""
+st.markdown(f"<style>{CSS}</style>", unsafe_allow_html=True)
+
+M_CLICK, M_DESENHO = "Clicar no mapa", "Desenhar contorno"
 for k, v in dict(map_v=0, centro=None, gj_desenho=None, ultimo_clique=None).items():
     st.session_state.setdefault(k, v)
 
@@ -333,28 +395,53 @@ def limpar():
     st.session_state.update(centro=None, gj_desenho=None, ultimo_clique=None)
     st.session_state["map_v"] += 1  # mapa novo: some a marcação e volta a mostrar o DF
 
+def escolha(rotulo, opcoes, chave, **kw):
+    """Seletor em formato de botões (cai para radio em versões antigas do Streamlit)."""
+    f = getattr(st, "segmented_control", None)
+    if f is None: return st.radio(rotulo, opcoes, key=chave, horizontal=True, **kw)
+    return f(rotulo, opcoes, default=opcoes[0], key=chave, **kw) or opcoes[0]
+
+esc = lambda x: _h.escape(str(x))
+html = lambda s: st.markdown(s, unsafe_allow_html=True)
+lis = lambda xs, c: "".join(f'<li class="{c}">{esc(x)}</li>' for x in xs)
+barra = lambda p: f'<span class="fit"><i style="width:{p}%"></i></span>'
+
+def destaque(r, mes):
+    rot = "Combina muito com a sua terra" if r["pts"] >= 70 else "Combina com a sua terra"
+    return ('<section class="destaque">' f'<h3>Plantar {esc(r["nome"])} em {MES[mes - 1]}</h3><p>{esc(r["desc"])}</p>'
+            f'{barra(r["pts"])}<small>{rot}</small><div class="duas">'
+            f'<div><h5>Por que combina</h5><ul>{lis(r["bom"][:4] or ["Sem pontos fortes com os dados que temos."], "ok")}</ul></div>'
+            f'<div><h5>Pontos de atenção</h5><ul>{lis(r["cuid"][:4] or ["Nenhum alerta com os dados que temos."], "nd")}</ul></div></div></section>')
+
+def linha(r):
+    t = (r["bom"] or r["cuid"] or [r["desc"]])[0]
+    return f'<div class="linha"><div><b>{esc(r["nome"])}</b><span>{esc(r["desc"])}</span></div>{barra(r["pts"])}<p>{esc(t)}</p></div>'
+
+def dado(rot, val, fonte):
+    v = f"<dd>{esc(val)}</dd>" if val else '<dd class="falta">Sem dado</dd>'
+    return f'<div><dt>{rot}</dt>{v}<dd class="fonte">{fonte}</dd></div>'
+
 with st.sidebar:
-    st.markdown("### 🔬 Modo técnico")
-    tecnico = st.toggle("Mostrar vegetação e radar no mapa")
+    st.markdown("### Modo técnico")
+    tecnico = st.toggle("Camadas de vegetação e radar no mapa")
     st.caption("Para quem entende de sensoriamento remoto. O parecer técnico completo fica no fim da página.")
 
-st.title("🌱 O que plantar na sua terra?")
-st.caption("Marque sua terra no mapa, responda algumas perguntas e veja o que combina com o clima, o terreno e a época. "
-           "Usamos dados de satélite da NASA.")
-modo = st.session_state.get("modo", M_CLICK)
+html('<div class="topo"><span class="marca">RotaDF</span>'
+     '<span class="lema">Guia de plantio para o Distrito Federal, com dados de satélite da NASA</span></div>')
+modo = st.session_state.get("modo") or M_CLICK
 ha_tam = TAM[st.session_state.get("tam", list(TAM)[1])]
 if modo == M_CLICK and st.session_state["centro"]:
     gj = quadrado(*st.session_state["centro"], ha_tam)
 else:
     gj = st.session_state["gj_desenho"] if modo == M_DESENHO else None
 
-left, right = st.columns([3, 2], gap="large")
+left, right = st.columns([1.7, 1], gap="large")
 with left:
     try:
         urls = layers(gj) if (gj and tecnico and EE_OK) else {}
     except Exception:
-        urls = {}
-    out = st_folium(construir_mapa(gj, urls, modo == M_DESENHO), height=580, use_container_width=True,
+        urls = {}  # o mapa continua funcionando sem as camadas
+    out = st_folium(construir_mapa(gj, urls, modo == M_DESENHO), height=600, use_container_width=True,
                     key=f"mapa{st.session_state['map_v']}", returned_objects=["last_clicked", "last_active_drawing"]) or {}
     if modo == M_CLICK:
         c = out.get("last_clicked")
@@ -365,84 +452,79 @@ with left:
         if dr and json.dumps(dr["geometry"]) != gj:
             st.session_state["gj_desenho"] = json.dumps(dr["geometry"]); st.rerun()
 
-with right:
-    st.markdown("### 1️⃣ Onde fica sua terra?")
-    st.radio("Como prefere marcar?", [M_CLICK, M_DESENHO], key="modo", on_change=limpar, horizontal=True)
+with right, st.container(border=True):
+    html('<div class="passo"><b>1</b><span>Marque a sua terra</span></div>')
+    escolha("Como prefere marcar?", [M_CLICK, M_DESENHO], "modo", on_change=limpar)
     if modo == M_CLICK:
-        st.selectbox("Tamanho aproximado da terra", list(TAM), index=1, key="tam",
-                     help="1 hectare é mais ou menos um campo de futebol.")
-        st.caption("Clique no mapa no meio da sua terra. Errou? É só clicar em outro lugar.")
+        st.selectbox("Tamanho aproximado", list(TAM), index=1, key="tam", help="1 hectare é mais ou menos um campo de futebol.")
+        st.caption("Clique no mapa, no meio da terra. Errou? Clique em outro ponto.")
     else:
-        st.caption("Use o botão ⬠ do mapa: clique nos cantos da terra e termine no primeiro ponto. "
-                   "Errou no meio do desenho? Clique em **Cancelar** no mapa.")
-    st.button("🗑️ Apagar e começar de novo", on_click=limpar, disabled=not gj)
+        st.caption("Use o botão de polígono do mapa: clique nos cantos e termine no primeiro ponto. "
+                   "Errou no meio do desenho? Use Cancelar, no próprio mapa.")
+    st.button("Apagar e começar de novo", on_click=limpar, disabled=not gj)
     if not gj:
-        st.info("👈 Marque sua terra no mapa para continuar.")
+        html('<p class="nota">Marque a sua terra no mapa para ver o que combina com ela.</p>')
         st.stop()
     ha = area_ha(gj)
-    st.success(f"Terra marcada: cerca de {ha:,.0f} hectares.".replace(",", "."))
     if ha > 5000:
-        st.warning("Essa área é muito grande (mais de 5.000 hectares). Marque só a sua terra para o resultado ser útil."); st.stop()
+        html('<p class="nota">Essa área é muito grande (mais de 5.000 hectares). Marque só a sua terra.</p>'); st.stop()
+    html(f'<p class="mut">Terra marcada: cerca de {ha:,.0f} hectares.</p>'.replace(",", "."))
 
-    st.markdown("### 2️⃣ Conte um pouco sobre você")
-    nivel = st.radio("Você já plantou antes?", list(NIVEIS))
-    irriga = st.radio("Tem água para irrigar?", list(AGUA))
-    obj = st.radio("O que você quer?", list(OBJ))
-    mes = st.selectbox("Quando pretende plantar?", list(range(1, 13)), index=TODAY.month - 1,
+    html('<div class="passo"><b>2</b><span>Conte um pouco sobre você</span></div>')
+    nivel = escolha("Você já plantou antes?", list(NIVEIS), "nivel")
+    irriga = escolha("Tem água para irrigar?", list(AGUA), "agua")
+    obj = escolha("O que você quer?", list(OBJ), "obj")
+    mes = st.selectbox("Quando pretende plantar?", list(range(1, 13)), index=TODAY.month - 1, key="mes",
                        format_func=lambda m: MES[m - 1].capitalize() + (" (este mês)" if m == TODAY.month else ""))
-    ult_nome = st.selectbox("O que plantou por último nesta terra?", [NUNCA, PARADA] + [c["nome"] for c in CAT])
+    ult_nome = st.selectbox("O que plantou por último nesta terra?", [NUNCA, PARADA] + [c["nome"] for c in CAT], key="ult")
 
-with st.spinner("Olhando sua terra pelo satélite… (pode levar um minuto)"):
+with st.spinner("Consultando os satélites… pode levar um minuto."):
     d = coletar(gj)
 perfil = dict(nivel=NIVEIS[nivel], irriga=AGUA[irriga], obj=OBJ[obj], ha=ha)
 ultimo = POR_NOME.get(ult_nome)
 ok, motivos = ranking(d, perfil, mes, ultimo)
 
-st.divider()
-st.markdown(f"## ✅ O que combina com a sua terra em {MES[mes - 1]}")
+html(f'<h2 class="sec">O que combina com a sua terra em {MES[mes - 1]}</h2>')
 if not ok:
-    st.warning("Nada combina bem com a sua terra nesta época. " + (
-        "Sem irrigação a chuva não é suficiente e várias culturas dessa época precisam de água: tente outro mês ou veja se dá para irrigar."
-        if not perfil["irriga"] else "Tente outro mês."))
-for col, r in zip(st.columns(3), ok[:3]):
-    with col:
-        rot = "Combina muito" if r["pts"] >= 70 else "Combina" if r["pts"] >= 50 else "Combina pouco"
-        st.markdown(f"### {r['emoji']} {r['nome']}")
-        st.progress(r["pts"] / 100, text=rot)
-        st.caption(r["desc"])
-        for t in r["bom"][:3]: st.markdown(f"✅ {t}")
-        for t in r["cuid"][:3]: st.markdown(f"⚠️ {t}")
-if len(ok) > 3:
-    st.caption("Outras possibilidades: " + ", ".join(r["nome"] for r in ok[3:6]))
+    html('<p class="nota">Nada combina bem com a sua terra nesta época. ' + (
+        "Sem irrigação a chuva não é suficiente e várias culturas dessa época precisam de água. Tente outro mês ou veja se dá para irrigar."
+        if not perfil["irriga"] else "Tente outro mês.") + "</p>")
+else:
+    html(destaque(ok[0], mes))
+    if len(ok) > 1:
+        html("<div>" + "".join(linha(r) for r in ok[1:4]) + "</div>")
+    if len(ok) > 4:
+        html('<p class="mut">Também possível: ' + esc(", ".join(r["nome"] for r in ok[4:7])) + ".</p>")
 
-st.markdown("## 🔄 E depois? Um plano para os próximos meses")
+html('<h2 class="sec">E depois? Um plano de rotação</h2>')
 seq = plano(d, perfil, mes, ultimo)
-for i, (mm, r, espera) in enumerate(seq, 1):
-    st.markdown(f"**{i}. {MES[mm - 1].capitalize()}: {r['emoji']} {r['nome']}** — " + (r["bom"][0] if r["bom"] else r["desc"])
-                + (f" _(a terra descansa {espera} mês(es) antes)_" if espera else ""))
-st.caption("A ideia é alternar famílias de plantas e incluir uma planta que devolve nitrogênio (feijão, crotalária), "
-           "para cuidar do solo e interromper pragas e doenças.")
+html('<ol class="trilha">' + "".join(
+    f'<li><time>{MES[mm - 1]}</time><b>{esc(r["nome"])}</b><span>{esc(r["bom"][0] if r["bom"] else r["desc"])}</span>'
+    + (f"<em>A terra descansa {e} mês(es) antes.</em>" if e else "") + "</li>" for mm, r, e in seq) + "</ol>")
+html('<p class="mut">A ideia é alternar famílias de plantas e incluir uma que devolve nitrogênio ao solo (feijão, crotalária), '
+     'para cuidar da terra e interromper pragas e doenças.</p>')
 
-st.markdown("## 📡 O que sabemos sobre a sua terra")
-cj = clima_janela(d.get("clima"), mes, 4); t = d.get("terreno"); s = d.get("solo")
-c1, c2, c3 = st.columns(3)
-c1.metric("Temperatura nos próximos meses", f"{cj['t']:.0f} °C" if cj else "sem dado")
-c2.metric("Chuva esperada (4 meses)", f"{cj['chuva']:.0f} mm" if cj else "sem dado")
-c3.metric("Umidade do ar", f"{cj['ur']:.0f}%" if cj and cj["ur"] is not None else "sem dado")
-c1.metric("Altitude", f"{t['alt']:.0f} m" if t else "sem dado")
-c2.metric("Terreno", "sem dado" if not t else "Plano" if t["decl"] <= 3 else "Inclinado" if t["decl"] <= 6 else "Muito inclinado")
-c3.metric("Umidade do solo na região", "sem dado" if not s else
-          "🔴 Bem mais seca que o normal" if s["pct"] < 0.25 else "🟡 Um pouco mais seca" if s["pct"] < 0.4
-          else "🟢 Normal" if s["pct"] <= 0.6 else "💧 Mais úmida que o normal")
+html('<h2 class="sec">O que sabemos sobre a sua terra</h2>')
+cj, t, s, veg = clima_janela(d.get("clima"), mes, 4), d.get("terreno"), d.get("solo"), d.get("veg")
+nasa = "NASA POWER, vale para a região"
+html('<dl class="dados">' + "".join([
+    dado("Temperatura nos próximos meses", cj and f"{cj['t']:.0f} °C em média", nasa),
+    dado("Chuva esperada em 4 meses", cj and f"{cj['chuva']:.0f} mm", nasa),
+    dado("Umidade do ar", cj and cj["ur"] is not None and f"{cj['ur']:.0f}%", nasa),
+    dado("Altitude", t and f"{t['alt']:.0f} m", "NASA SRTM, 30 metros"),
+    dado("Terreno", t and ("Plano" if t["decl"] <= 3 else "Inclinado" if t["decl"] <= 6 else "Muito inclinado"), "NASA SRTM, 30 metros"),
+    dado("Umidade do solo agora", s and ("Bem mais seca que o normal" if s["pct"] < 0.25 else "Um pouco mais seca que o normal"
+         if s["pct"] < 0.4 else "Normal" if s["pct"] <= 0.6 else "Mais úmida que o normal"), "NASA GLDAS, vale para a região"),
+    dado("Meses com pouca planta no último ano", veg is not None and f"{int((veg < 0.3).sum())} de 12", "NASA MODIS, 250 metros")]) + "</dl>")
 conf = confianca(d)
-st.markdown(f"**Confiança desta sugestão: {conf}.** " + {"alta": "Conseguimos todos os dados.",
-            "média": "Faltou algum dado; veja os itens marcados como sem dado.",
-            "baixa": "Faltaram dados importantes (como o clima); use só como ideia inicial."}[conf])
-st.markdown("**O que NÃO sabemos:** o tipo e a fertilidade do seu solo, o preço de venda, o que já foi plantado aí "
-            "e a sua estrutura (máquinas, mão de obra). O clima e a umidade do solo valem para a região, não só para a sua terra. "
-            "Converse com um agrônomo ou com a Emater-DF antes de decidir.")
+html(f'<p class="nota"><b>Confiança da sugestão: {conf}.</b> ' + {"alta": "Conseguimos todos os dados.",
+     "média": "Faltou algum dado; veja os itens marcados como sem dado.",
+     "baixa": "Faltaram dados importantes, como o clima. Use só como ideia inicial."}[conf] +
+     "<br><b>O que não sabemos:</b> o tipo e a fertilidade do solo, o preço de venda, o que já foi plantado aí e a sua estrutura "
+     "(máquinas, mão de obra). Clima e umidade do solo valem para a região, não só para a sua terra. "
+     "Converse com um agrônomo ou com a Emater-DF antes de decidir.</p>")
 
-with st.expander("📋 Parecer técnico (para quem entende do assunto)"):
+with st.expander("Parecer técnico (para quem entende do assunto)"):
     fontes = [("Clima (T2M, chuva, UR)", d.get("clima"), "NASA POWER, média mensal 2015–" + str(TODAY.year - 1) + ", ~50 km"),
               ("Altitude e declive", d.get("terreno"), "NASA SRTM, 30 m"),
               ("Umidade do solo 0–10 cm", d.get("solo"), "NASA GLDAS 2.1 Noah, 0,25°; percentil do mês vs. 2010–hoje"),
