@@ -451,7 +451,7 @@ class _LimitarMapa(MacroElement):
 ZOOM_MIN = 9
 COR = "#F5B700"  # amarelo de ipê: contrasta com o satélite e com o mapa
 
-def construir_mapa(gj, urls, desenho):
+def construir_mapa(gj, desenho):
     # obs.: com tiles=None o folium ignora min_zoom/max_zoom; os limites de zoom são aplicados em _LimitarMapa
     m = folium.Map(location=[-15.78, -47.80], zoom_start=10, tiles=None, max_bounds=True, **DF_BOUNDS)
     folium.TileLayer("OpenStreetMap", name="Mapa", no_wrap=True, show=False).add_to(m)
@@ -467,15 +467,46 @@ def construir_mapa(gj, urls, desenho):
     if gj:
         pts = pontos(gj)
         folium.GeoJson(json.loads(gj), name="Sua terra", style_function=lambda _: {"color": COR, "weight": 3, "fillOpacity": 0.15}).add_to(m)
-        for name, url in urls.items():
-            folium.TileLayer(tiles=url, attr="Google Earth Engine", name=name, overlay=True, show=name.startswith("Saúde")).add_to(m)
         m.fit_bounds([[min(p[1] for p in pts), min(p[0] for p in pts)], [max(p[1] for p in pts), max(p[0] for p in pts)]],
                      padding=(40, 40), max_zoom=15)  # centraliza na terra marcada
     else:
         m.fit_bounds([[-16.07, -48.30], [-15.48, -47.30]])  # começa mostrando o DF inteiro
-    folium.LayerControl(collapsed=True).add_to(m)
-    _LimitarMapa(DF_BOUNDS, ZOOM_MIN).add_to(m)
+    _LimitarMapa(DF_BOUNDS, ZOOM_MIN).add_to(m)  # o controle de camadas vai à parte, em `grupos_camadas` (#15)
     return m
+
+class _Visiveis(MacroElement):
+    """Depois de trocar as camadas, deixa visíveis só as que o usuário tinha ligado (no começo, só a vegetação).
+    O st_folium liga todos os grupos de `feature_group_to_add`; aqui os outros são tirados do mapa. Só conta o que
+    o usuário fez no controle de camadas (`_handlingClick`), não a troca dos grupos pelo st_folium."""
+    _template = Template("""{% macro script(this, kwargs) %}
+    (function () {
+      var m = {{ this._parent._parent.get_name() }}, grupos = { {% for g in this.grupos %}{{ g.layer_name|tojson }}: {{ g.get_name() }},{% endfor %} };
+      var vis = window._rotadf_visiveis;
+      if (!vis) {
+        vis = window._rotadf_visiveis = {{ this.inicio|tojson }};
+        var anotar = function (e) { if (window.layer_control && window.layer_control._handlingClick) vis[e.name] = e.type === 'overlayadd'; };
+        m.on('overlayadd', anotar); m.on('overlayremove', anotar);
+      }
+      for (var n in grupos) { if (!vis[n]) m.removeLayer(grupos[n]); }
+    })();
+    {% endmacro %}""")
+    def __init__(self, grupos):
+        super().__init__()
+        self.grupos, self.inicio = grupos, {g.layer_name: g.show for g in grupos}
+
+def grupos_camadas(urls):
+    """Camadas do modo técnico, uma por FeatureGroup, para o `feature_group_to_add` do st_folium (#15): o mapa já
+    aberto troca só esses grupos e o controle de camadas, sem recarregar; terra, zoom e posição ficam como estão."""
+    grupos = []
+    for nome in CAMADAS:
+        if nome in urls:
+            g = folium.FeatureGroup(name=nome, show=nome == CAMADAS[0])
+            folium.TileLayer(tiles=urls[nome], attr="Google Earth Engine", name=nome).add_to(g)
+            grupos.append(g)
+    if grupos:
+        fim = folium.FeatureGroup(name="Camadas visíveis", control=False)  # roda depois de todos os grupos
+        _Visiveis(list(grupos)).add_to(fim); grupos.append(fim)
+    return grupos
 # --- FIM MAPA ---
 
 # ---------------- Interface ----------------
@@ -592,15 +623,24 @@ if modo == M_CLICK and st.session_state["centro"]:
 else:
     gj = st.session_state["gj_desenho"] if modo == M_DESENHO else None
 
-left, right = st.columns([1.7, 1], gap="large")
-camadas_pendentes = False  # camadas do modo técnico fora do cache: o mapa sai sem elas e elas vêm no fim (#7)
-with left:
-    cam = None
+RENOVAR_CAMADAS = 600  # s; a aba parada confere as camadas a cada 10 min e o `ttl` de `layers` renova a cada hora (#15)
+
+def mapa(gj, tecnico, modo, vez):
+    """Mapa, cliques/desenho e aviso das camadas. É um fragmento: com o modo técnico ligado e uma terra marcada, roda
+    sozinho a cada RENOVAR_CAMADAS, mesmo com a aba parada, para as URLs das camadas não expirarem (#15). Nessa volta
+    sozinho (`vez` já consumido) `layers` é chamado direto: se o cache expirou, renova ali mesmo, e o mapa aberto só
+    troca as camadas. Na execução completa, camadas fora do cache ficam para o fim da página (#7)."""
+    completa, cam, pendentes = next(vez, False), None, False
     if gj and tecnico and EE_OK:
-        try: cam = layers(gj, REFERENCIA, TODAY.isoformat(), _calc=_so_cache)
-        except _NaoEstaNoCache: camadas_pendentes = True
-    out = st_folium(construir_mapa(gj, cam["urls"] if cam else {}, modo == M_DESENHO), height=600, use_container_width=True,
-                    key=f"mapa{st.session_state['map_v']}", returned_objects=["last_clicked", "last_active_drawing"]) or {}
+        if completa:
+            try: cam = layers(gj, REFERENCIA, TODAY.isoformat(), _calc=_so_cache)
+            except _NaoEstaNoCache: pendentes = True
+        else:  # dia de hoje, não o da última execução completa (a aba pode estar parada há horas)
+            hoje = dt.date.today(); cam = layers(gj, hoje.replace(day=1).isoformat(), hoje.isoformat())
+    out = st_folium(construir_mapa(gj, modo == M_DESENHO), height=600, use_container_width=True,
+                    key=f"mapa{st.session_state['map_v']}", returned_objects=["last_clicked", "last_active_drawing"],
+                    feature_group_to_add=grupos_camadas(cam["urls"] if cam else {}),
+                    layer_control=folium.LayerControl(collapsed=True)) or {}
     if modo == M_CLICK:
         c = out.get("last_clicked")
         if c and (c["lat"], c["lng"]) != st.session_state["ultimo_clique"]:
@@ -610,9 +650,15 @@ with left:
         if dr and json.dumps(dr["geometry"]) != gj:
             st.session_state["gj_desenho"] = json.dumps(dr["geometry"]); st.rerun()
     aviso = st.empty()  # perto do mapa; some quando as camadas entram
-    if camadas_pendentes: aviso.caption(CARREGANDO_CAMADAS)
+    if pendentes: aviso.caption(CARREGANDO_CAMADAS)
     elif cam and cam["falhas"]: aviso.caption(aviso_camadas(cam["falhas"]))
     elif gj and tecnico and not EE_OK: aviso.caption(aviso_camadas(CAMADAS))
+    return pendentes, aviso
+
+left, right = st.columns([1.7, 1], gap="large")
+with left:  # modo técnico desligado: sem run_every, a aba parada não roda nada (nem consulta o Earth Engine)
+    renovar = RENOVAR_CAMADAS if gj and tecnico and EE_OK else None
+    camadas_pendentes, aviso = st.fragment(mapa, run_every=renovar)(gj, tecnico, modo, iter([True]))
 
 def carregar_camadas():
     """Calcula as camadas que ficaram fora do cache (agora já no cache de `layers`, por gj) e redesenha o mapa com

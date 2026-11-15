@@ -7,7 +7,7 @@ import pytest
 from folium.plugins import Draw
 from streamlit.delta_generator import DeltaGenerator
 
-from conftest import PONTO_DF
+from conftest import PONTO_DF, camadas_tecnicas
 from fake_ee import geometria
 
 CAMADAS = ("Saúde da vegetação (verde = saudável)", "Radar (bruto, com ruído)", "Radar (filtrado)")
@@ -25,6 +25,7 @@ def eventos():
     ev, cliques, caption = [], [], DeltaGenerator.caption
 
     def st_folium(m, *a, **kw):
+        m.grupos_tecnicos = kw.get("feature_group_to_add")  # camadas do modo técnico (#15)
         ev.append(("mapa", m))
         if cliques:
             lat, lng = cliques.pop(0)
@@ -55,7 +56,7 @@ class Eventos:
 
 
 def camadas(m):
-    return {c.layer_name: c for c in m._children.values() if isinstance(c, folium.TileLayer) and c.layer_name in CAMADAS}
+    return camadas_tecnicas(m.grupos_tecnicos)
 
 
 def terra(m):

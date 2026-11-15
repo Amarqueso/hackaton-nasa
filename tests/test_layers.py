@@ -5,7 +5,7 @@ import folium
 import pytest
 from streamlit.runtime.caching import cache_utils
 
-from conftest import PONTO_DF
+from conftest import PONTO_DF, camadas_tecnicas
 
 CAMADAS = {
     "Saúde da vegetação (verde = saudável)",
@@ -33,8 +33,8 @@ def mapa(componente):
 
 
 def urls(componente):
-    return {c.layer_name: c.tiles for c in mapa(componente)._children.values()
-            if isinstance(c, folium.TileLayer) and c.layer_name in CAMADAS}
+    grupos = componente.call_args.kwargs["feature_group_to_add"]
+    return {nome: c.tiles for nome, c in camadas_tecnicas(grupos).items()}
 
 
 def terra(componente):

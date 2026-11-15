@@ -3,13 +3,15 @@ import contextlib
 import builtins
 import pathlib
 import sys
+import types
 from unittest import mock
 
+import folium
 import pytest
 import streamlit as st
 from streamlit.runtime.caching import cache_data_api
 from streamlit.runtime.caching.storage import local_disk_cache_storage
-from streamlit.testing.v1 import AppTest, app_test
+from streamlit.testing.v1 import AppTest, app_test, local_script_runner
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 from fake_ee import FakeEE  # noqa: E402
@@ -27,6 +29,18 @@ def resposta_power():
     r.json.return_value = {"properties": {"parameter": par}}
     r.raise_for_status.return_value = None
     return r
+
+
+def camadas_tecnicas(grupos):
+    """Camadas do modo técnico passadas ao st_folium em `feature_group_to_add` (#15), em ordem:
+    {nome: (show, url)}. O grupo sem controle (`control=False`) só ajusta a visibilidade e fica de fora."""
+    out = {}
+    for g in grupos or []:
+        if g.control:
+            tiles = [c for c in g._children.values() if isinstance(c, folium.TileLayer)]
+            assert len(tiles) == 1, g.layer_name
+            out[g.layer_name] = types.SimpleNamespace(show=g.show, tiles=tiles[0].tiles)
+    return out
 
 
 class App:
@@ -49,6 +63,19 @@ class App:
         st.cache_resource.clear()
         self.at = AppTest.from_file(APP, default_timeout=30)
         return self
+
+    def fragmentos(self):
+        """Ids dos fragmentos (`st.fragment`) registrados na última execução."""
+        return list(self.at._fragment_storage._fragments)
+
+    def rodar_sozinho(self):
+        """Simula o `run_every` de um fragmento numa aba parada (#15): o navegador pede para rodar só o fragmento
+        (`is_auto_rerun`), sem a página inteira. Depois disso `self.at` só tem o que o fragmento desenhou."""
+        ids, real = self.fragmentos(), local_script_runner.RerunData
+        assert len(ids) == 1, ids
+        rerun = lambda **kw: real(fragment_id_queue=ids, is_auto_rerun=True, **kw)
+        with mock.patch.object(local_script_runner, "RerunData", rerun):
+            return self.run()
 
     def marcar_terra(self, ponto=PONTO_DF):
         self.at.session_state["centro"] = ponto
