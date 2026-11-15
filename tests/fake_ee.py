@@ -90,6 +90,7 @@ class FakeEE(types.ModuleType):
     def __init__(self, init_erro=None):
         super().__init__("ee")
         self.init_erro = init_erro
+        self.inits = 0
         self.chamadas = Counter()
         self.mapas = []
         self.mapa_erro = None
@@ -103,6 +104,9 @@ class FakeEE(types.ModuleType):
         }
 
     def Initialize(self, *a, **kw):
+        self.inits += 1
+        if callable(self.init_erro):  # ex.: uma função que trava, para simular a rede sem resposta
+            return self.init_erro()
         if self.init_erro:
             raise Exception(self.init_erro)
 
