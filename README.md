@@ -72,4 +72,35 @@ A aplicação será aberta no navegador.
 3. Selecione sua prioridade.
 4. Consulte a recomendação e os indicadores ambientais.
 
+## Dá para plantar nessa área? (`aptidao.py`)
+
+Antes da sugestão, o satélite identifica o que existe na terra marcada:
+
+- **Dynamic World** (Sentinel-2, 10 m, classe mais frequente nos últimos 6 meses): construções, água, brejo/vereda,
+  árvores, cerrado arbustivo, lavoura, pasto e solo exposto.
+- **JRC Global Surface Water**: água permanente e áreas que alagam em alguns anos.
+- **WDPA**: unidades de conservação de proteção integral (ex.: Parque Nacional de Brasília).
+
+Resultado: 🟢 apta, 🟡 com cuidados (com a área plantável estimada) ou 🔴 não recomendada (≥ 30% construído,
+≥ 30% água ou brejo, dentro de UC de proteção integral ou quase só vegetação nativa). Com 🔴 a sugestão fica
+escondida até o produtor marcar que sabe que a área é plantável.
+
+## El Niño / La Niña (`enso.py`)
+
+A fase do ENSO vem do **ONI** da NOAA/CPC (`oni.ascii.txt`, cache de 6 h): El Niño com ONI ≥ +0,5 °C, La Niña com
+≤ −0,5 °C, confirmado depois de 5 trimestres seguidos (antes disso, "em formação"). Com El Niño moderado ou mais
+forte e sem irrigação, culturas de alta demanda de água perdem pontos, as de baixa ganham, e o ZARC passa a aceitar
+só datas com risco de 20%.
+
+## Calendário oficial ZARC de Brasília (`zarc.py`)
+
+Usa a **Tábua de Risco do ZARC** (MAPA, dados abertos) do município de Brasília (IBGE 5300108), que cobre o DF,
+gravada em `data/zarc_brasilia.csv`. Soja, milho, feijão e sorgo são conferidos pelo tipo de solo (AD1 a AD6,
+perguntado no passo 2) e pelo mês de plantio: fora do zoneamento a cultura perde 30 pontos (sem seguro rural/Proagro);
+com risco acima do aceito no ano, 10. Para atualizar quando sair uma safra nova (o arquivo nacional é grande):
+
+```bash
+python scripts/atualizar_zarc.py 2026-2027
+```
+
 Uma vez por ano, em janeiro, atualize a climatologia local da NASA POWER com `python scripts/gerar_clima_df.py --ano-fim <ano-anterior>` e versione `data/clima_power_df.json` (a fonte mostra o período gravado no arquivo).
