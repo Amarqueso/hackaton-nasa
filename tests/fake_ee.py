@@ -125,8 +125,10 @@ class FakeEE(types.ModuleType):
         with self._trava:
             url = f"https://fake/{len(self.mapas) + 1}/{{z}}/{{x}}/{{y}}"
             self.mapas.append((frozenset(linhagem), url))
-        if self.mapa_erro:
-            raise self.mapa_erro
+        # mapa_erro: uma exceção (todas as camadas falham) ou função(linhagem) -> exceção ou None (só algumas)
+        erro = self.mapa_erro(linhagem) if callable(self.mapa_erro) else self.mapa_erro
+        if erro:
+            raise erro
         return {"tile_fetcher": types.SimpleNamespace(url_format=url)}
 
     def _fonte(self, x=None, *a, **kw):
