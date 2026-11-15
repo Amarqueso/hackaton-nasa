@@ -75,7 +75,7 @@ def test_falha_na_renovacao_preserva_mapa_terra_e_resultados(app, relogio, mapas
 
     relogio[0] += 3601
     app.run()
-    assert len(app.ee.mapas) == 4  # houve tentativa de renovar; não reutilizou URLs antigas
+    assert len(app.ee.mapas) == 6  # tentou renovar as três (cada uma separada, #7); não reutilizou URLs antigas
     assert urls(mapas) == {}
     base = {c.layer_name for c in mapa(mapas)._children.values() if isinstance(c, folium.TileLayer)}
     assert {"Mapa", "Satélite"} <= base

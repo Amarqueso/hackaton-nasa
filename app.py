@@ -343,18 +343,44 @@ def confianca(d):
     n = sum(d.get(k) is not None for k in ("clima", "terreno", "solo", "veg"))
     return "alta" if n == 4 else "média" if n >= 2 else "baixa"
 
+CAMADAS = ("Saúde da vegetação (verde = saudável)", "Radar (bruto, com ruído)", "Radar (filtrado)")
+
 @st.cache_data(show_spinner=False, ttl=3600)
-def layers(gj, referencia, _hoje):
-    # A chave muda na virada do mês. Ao renovar pelo ttl, a janela diária termina no dia da consulta.
-    geom = ee.Geometry(json.loads(gj)); box = geom.buffer(1500).bounds()
-    end = ee.Date(_hoje)
-    hls = (ee.ImageCollection("NASA/HLS/HLSL30/v002").filterBounds(geom).filterDate(end.advance(-120, "day"), end)
-           .map(lambda i: i.updateMask(i.select("Fmask").bitwiseAnd(14).eq(0)).normalizedDifference(["B5", "B4"]))
-           .median().clip(box))
-    raw = s1(geom).filterDate(end.advance(-60, "day"), end).median()
-    out = {"Saúde da vegetação (verde = saudável)": (hls, NDVI_VIS), "Radar (bruto, com ruído)": (raw.clip(box), SAR_VIS),
-           "Radar (filtrado)": (lee(raw).clip(box), SAR_VIS)}
-    return {k: i.getMapId(v)["tile_fetcher"].url_format for k, (i, v) in out.items()}
+def layers(gj, referencia, _hoje, _calc=None):
+    """URLs das camadas do modo técnico: {"urls": {nome: url}, "falhas": {nome: erro}}. Cada camada é montada e
+    pedida (getMapId) na sua própria thread, sem nenhuma chamada st.*; a falha de uma não apaga as outras. Nunca
+    levanta exceção, então o resultado (com as falhas) fica no cache e o mapa não fica tentando de novo a cada
+    execução. A chave muda na virada do mês. Ao renovar pelo ttl, a janela diária termina no dia da consulta.
+    `_calc` como em `clima_power` (com `_so_cache`, só lê o cache)."""
+    if _calc: return _calc()
+    def montar(nome):
+        geom = ee.Geometry(json.loads(gj)); box = geom.buffer(1500).bounds()
+        end = ee.Date(_hoje)
+        if nome == CAMADAS[0]:
+            img = (ee.ImageCollection("NASA/HLS/HLSL30/v002").filterBounds(geom).filterDate(end.advance(-120, "day"), end)
+                   .map(lambda i: i.updateMask(i.select("Fmask").bitwiseAnd(14).eq(0)).normalizedDifference(["B5", "B4"]))
+                   .median().clip(box))
+            vis = NDVI_VIS
+        else:
+            raw = s1(geom).filterDate(end.advance(-60, "day"), end).median()
+            img, vis = (raw if nome == CAMADAS[1] else lee(raw)).clip(box), SAR_VIS
+        return img.getMapId(vis)["tile_fetcher"].url_format
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        futuros = {nome: ex.submit(montar, nome) for nome in CAMADAS}
+    urls, falhas = {}, {}
+    for nome, f in futuros.items():
+        try: urls[nome] = f.result()
+        except Exception as e: falhas[nome] = str(e)[:300]
+    return dict(urls=urls, falhas=falhas)
+
+CARREGANDO_CAMADAS = "Carregando as camadas de vegetação e radar…"
+
+def aviso_camadas(falhas):
+    """Mensagem curta sobre as camadas que não puderam ser carregadas."""
+    if len(falhas) == len(CAMADAS): return "Não foi possível carregar as camadas de vegetação e radar."
+    nomes = [f"“{n}”" for n in CAMADAS if n in falhas]
+    return (f"Não foi possível carregar a camada {nomes[0]}." if len(nomes) == 1
+            else f"Não foi possível carregar as camadas {', '.join(nomes[:-1])} e {nomes[-1]}.")
 
 # --- MAPA ---
 from branca.element import MacroElement, Template
@@ -541,12 +567,13 @@ else:
     gj = st.session_state["gj_desenho"] if modo == M_DESENHO else None
 
 left, right = st.columns([1.7, 1], gap="large")
+camadas_pendentes = False  # camadas do modo técnico fora do cache: o mapa sai sem elas e elas vêm no fim (#7)
 with left:
-    try:
-        urls = layers(gj, REFERENCIA, TODAY.isoformat()) if (gj and tecnico and EE_OK) else {}
-    except Exception:
-        urls = {}  # o mapa continua funcionando sem as camadas
-    out = st_folium(construir_mapa(gj, urls, modo == M_DESENHO), height=600, use_container_width=True,
+    cam = None
+    if gj and tecnico and EE_OK:
+        try: cam = layers(gj, REFERENCIA, TODAY.isoformat(), _calc=_so_cache)
+        except _NaoEstaNoCache: camadas_pendentes = True
+    out = st_folium(construir_mapa(gj, cam["urls"] if cam else {}, modo == M_DESENHO), height=600, use_container_width=True,
                     key=f"mapa{st.session_state['map_v']}", returned_objects=["last_clicked", "last_active_drawing"]) or {}
     if modo == M_CLICK:
         c = out.get("last_clicked")
@@ -556,6 +583,18 @@ with left:
         dr = out.get("last_active_drawing")
         if dr and json.dumps(dr["geometry"]) != gj:
             st.session_state["gj_desenho"] = json.dumps(dr["geometry"]); st.rerun()
+    aviso = st.empty()  # perto do mapa; some quando as camadas entram
+    if camadas_pendentes: aviso.caption(CARREGANDO_CAMADAS)
+    elif cam and cam["falhas"]: aviso.caption(aviso_camadas(cam["falhas"]))
+    elif gj and tecnico and not EE_OK: aviso.caption(aviso_camadas(CAMADAS))
+
+def carregar_camadas():
+    """Calcula as camadas que ficaram fora do cache (agora já no cache de `layers`, por gj) e redesenha o mapa com
+    elas. Como a chave é a terra, um clique em outro ponto no meio do caminho não leva estas camadas para a terra nova."""
+    if not camadas_pendentes: return
+    try: layers(gj, REFERENCIA, TODAY.isoformat())
+    except Exception: aviso.caption(aviso_camadas(CAMADAS)); return  # não deveria acontecer: layers não levanta
+    st.rerun()
 
 with right, st.container(border=True):
     html('<div class="passo"><b>1</b><span>Marque a sua terra</span></div>')
@@ -572,7 +611,8 @@ with right, st.container(border=True):
         st.stop()
     ha = area_ha(gj)
     if ha > 5000:
-        html('<p class="nota">Essa área é muito grande (mais de 5.000 hectares). Marque só a sua terra.</p>'); st.stop()
+        html('<p class="nota">Essa área é muito grande (mais de 5.000 hectares). Marque só a sua terra.</p>')
+        carregar_camadas(); st.stop()
     html(f'<p class="mut">Terra marcada: cerca de {ha:,.0f} hectares.</p>'.replace(",", "."))
 
     html('<div class="passo"><b>2</b><span>Conte um pouco sobre você</span></div>')
@@ -630,6 +670,7 @@ html(f'<p class="nota"><b>Confiança da sugestão: {conf}.</b> ' + {"alta": "Con
      "(máquinas, mão de obra). Clima e umidade do solo valem para a região, não só para a sua terra. "
      "Converse com um agrônomo ou com a Emater-DF antes de decidir.</p>")
 
+carregar_camadas()  # antes do radar, para o mapa ganhar as camadas o quanto antes
 radar, erros = None, dict(d.get("erros", {}))
 if tecnico and EE_OK:  # o radar não entra na recomendação: só é consultado no modo técnico
     with st.spinner("Carregando o radar…"):
