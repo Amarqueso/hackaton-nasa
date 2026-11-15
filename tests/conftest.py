@@ -6,7 +6,9 @@ from unittest import mock
 
 import pytest
 import streamlit as st
-from streamlit.testing.v1 import AppTest
+from streamlit.runtime.caching import cache_data_api
+from streamlit.runtime.caching.storage import local_disk_cache_storage
+from streamlit.testing.v1 import AppTest, app_test
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 from fake_ee import FakeEE  # noqa: E402
@@ -37,6 +39,14 @@ class App:
         self.spinners.clear()
         self.at.run()
         assert not self.at.exception, self.at.exception
+        return self
+
+    def reiniciar(self):
+        """Simula reiniciar o `streamlit run`: some o cache em memória (de todas as funções) e a sessão;
+        o cache em disco (`persist="disk"`, pasta temporária do teste) fica."""
+        cache_data_api._data_caches._function_caches = {}
+        st.cache_resource.clear()
+        self.at = AppTest.from_file(APP, default_timeout=30)
         return self
 
     def marcar_terra(self, ponto=PONTO_DF):
@@ -76,7 +86,18 @@ def fake_ee(monkeypatch):
 
 
 @pytest.fixture
-def app(fake_ee):
+def cache_disco(tmp_path, monkeypatch):
+    """Cache em disco (`persist="disk"`) como no `streamlit run`, numa pasta temporária do teste.
+    O AppTest usa um cache só em memória (ignora `persist`); aqui ele passa a usar o mesmo do servidor
+    (`LocalDiskCacheStorageManager`). A pasta é desviada para não ler nem apagar o ~/.streamlit/cache de verdade."""
+    pasta = tmp_path / "streamlit-cache"
+    monkeypatch.setattr(local_disk_cache_storage, "get_cache_folder_path", lambda: str(pasta))
+    monkeypatch.setattr(app_test, "MemoryCacheStorageManager", local_disk_cache_storage.LocalDiskCacheStorageManager)
+    return pasta
+
+
+@pytest.fixture
+def app(fake_ee, cache_disco):
     """App com EE falso e POWER falso. Limpa os caches do Streamlit (são globais no processo)."""
     st.cache_data.clear()
     st.cache_resource.clear()

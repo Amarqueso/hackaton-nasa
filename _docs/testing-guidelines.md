@@ -43,6 +43,10 @@ rodam ele inteiro com `streamlit.testing.v1.AppTest` (fixture `app` em `tests/co
   centro da célula da POWER, 0,5° × 0,625°, ou do pixel do FLDAS, 0,1°). Dois pontos da mesma célula fazem uma consulta
   só; para ver qual célula foi consultada, leia `app.get.call_args` (POWER) ou a geometria do ponto na linhagem do
   FLDAS (`tests/test_cache_regional.py`). Falha não entra no cache da célula.
+- **Cache em disco** (#5): `clima_power(lat, lon, ano_fim)` tem `persist="disk"`. O AppTest normalmente guarda o cache
+  só em memória; a fixture `cache_disco` (usada por `app`) troca pelo cache em disco do `streamlit run`, numa pasta
+  temporária do teste (nunca o `~/.streamlit/cache` de verdade). `app.reiniciar()` simula reiniciar o servidor: apaga
+  o cache em memória e a sessão, e o disco fica (`tests/test_cache_disco.py`).
 
 ## O que não dá para testar aqui
 
