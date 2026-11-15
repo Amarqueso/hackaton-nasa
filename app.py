@@ -102,8 +102,31 @@ def quadrado(lat, lon, ha):
                        [lon + dx, lat + dy], [lon - dx, lat + dy], [lon - dx, lat - dy]]]})
 
 # ---------------- Dados: NASA POWER (clima) e Earth Engine (terreno, umidade do solo, vegetação, radar) ----------------
+# Grades das fontes regionais: (borda sul/oeste da primeira célula, tamanho da célula), em graus.
+# NASA POWER (meteorologia, MERRA-2): células de 0,5° lat × 0,625° lon centradas em lat = 0,5·k e lon = -180 + 0,625·k
+# (conferido na API: -15,76 e -15,74 caem em células diferentes, e -47,83 e -47,80 também).
+# FLDAS (Earth Engine): pixels de 0,1° com bordas a partir de -180 / -60 (bbox do catálogo), centro em x,x5.
+GRADE_POWER = ((-90.25, 0.5), (-180.3125, 0.625))
+GRADE_FLDAS = ((-60.0, 0.1), (-180.0, 0.1))
+
+def celula(lat, lon, grade):
+    """Centro (lat, lon) da célula da grade onde fica o ponto. Um ponto na divisa vai sempre para a célula
+    ao norte/leste (floor), então o mesmo ponto dá sempre a mesma célula."""
+    def c(x, borda, passo):
+        return round(borda + (math.floor(round((x - borda) / passo, 9)) + 0.5) * passo, 6)
+    (b_lat, p_lat), (b_lon, p_lon) = grade
+    return float(c(lat, b_lat, p_lat)), float(c(lon, b_lon, p_lon))
+
+class _NaoEstaNoCache(Exception):
+    """Levantada por `_so_cache`: a função regional foi chamada só para ler o cache."""
+
+def _so_cache(): raise _NaoEstaNoCache
+
 @st.cache_data(show_spinner=False)
-def clima_power(lat, lon):
+def clima_power(lat, lon, _calc=None):
+    """Clima da célula da POWER com centro (lat, lon). O cache é por célula. `_calc` fica fora da chave do cache
+    (começa com _) e serve para `coletar` ler ou preencher o cache na thread principal (ver `coletar`)."""
+    if _calc: return _calc()
     r = requests.get("https://power.larc.nasa.gov/api/temporal/monthly/point", timeout=40, params=dict(
         parameters="T2M,PRECTOTCORR,RH2M", community="AG", longitude=lon, latitude=lat,
         start=2015, end=TODAY.year - 1, format="JSON"))
@@ -122,10 +145,13 @@ def terreno(geom):
     r = e.addBands(ee.Terrain.slope(e)).reduceRegion(ee.Reducer.mean(), geom, 30, maxPixels=1e9).getInfo()
     return dict(alt=r["elevation"], decl=r["slope"])
 
-def umidade_solo(geom):
-    """Umidade do solo (0-10 cm, NASA FLDAS, mensal, 0,1° ≈ 11 km): último mês publicado vs. o mesmo mês de 2010 até
-    o ano anterior ao dele. A série inteira vem num único getInfo e o percentil é calculado aqui."""
-    ponto, banda = geom.centroid(1), "SoilMoi00_10cm_tavg"
+@st.cache_data(show_spinner=False)
+def umidade_solo(lat, lon, _calc=None):
+    """Umidade do solo (0-10 cm, NASA FLDAS, mensal, 0,1° ≈ 11 km) no pixel com centro (lat, lon): último mês
+    publicado vs. o mesmo mês de 2010 até o ano anterior ao dele. A série inteira vem num único getInfo e o percentil
+    é calculado aqui. O cache é por pixel; `_calc` como em `clima_power`."""
+    if _calc: return _calc()
+    ponto, banda = ee.Geometry({"type": "Point", "coordinates": [lon, lat]}), "SoilMoi00_10cm_tavg"
     col = (ee.ImageCollection("NASA/FLDAS/NOAH01/C/GL/M/V001").select(banda)
            .filterDate("2010-01-01", (TODAY + dt.timedelta(days=1)).isoformat()))
     feats = ee.FeatureCollection(col.map(lambda img: ee.Feature(None, {
@@ -147,23 +173,38 @@ def _ou_none(ser): return None if ser.dropna().empty else ser
 @st.cache_data(show_spinner=False)
 def coletar(gj):
     """Junta tudo o que o satélite sabe da área. O que falhar fica None (e a tela avisa que não temos o dado).
-    As consultas rodam ao mesmo tempo, uma thread por consulta. Nas threads não há nenhuma chamada st.*:
-    o clima usa a função sem o cache (o cache de coletar já cobre a terra), e d/erros são montados aqui,
-    na thread principal, a partir dos resultados. O Earth Engine usa a sessão aberta uma vez em init_ee."""
+    As consultas rodam ao mesmo tempo, uma thread por consulta. Nas threads não há nenhuma chamada st.*.
+    Clima e solo são regionais e têm cache por célula da grade de cada fonte (ver `_so_cache`): aqui, na thread
+    principal, cada um é lido do cache da célula; se não estiver lá, a thread roda a função sem o cache
+    (`__wrapped__`) e o resultado é guardado no cache da célula depois, também aqui. Terreno e NDVI dependem da
+    terra exata e ficam no cache de coletar (por gj). d/erros são montados na thread principal.
+    O Earth Engine usa a sessão aberta uma vez em init_ee."""
     lat, lon = centro_de(gj)
-    tarefas = {"clima": lambda: clima_power.__wrapped__(round(lat, 1), round(lon, 1))}
+    regionais = {"clima": (clima_power, celula(lat, lon, GRADE_POWER))}
+    tarefas = {}
     if EE_OK:
         geom = ee.Geometry(json.loads(gj))
+        regionais["solo"] = (umidade_solo, celula(lat, lon, GRADE_FLDAS))
         tarefas["terreno"] = lambda: terreno(geom)
-        tarefas["solo"] = lambda: umidade_solo(geom)
         tarefas["veg"] = lambda: _ou_none(month_series(lambda s, e: ee.ImageCollection("MODIS/061/MOD13Q1")
                 .filterDate(s, e).select("NDVI").mean(), "NDVI", geom, 250) * 1e-4)
-    with ThreadPoolExecutor(max_workers=len(tarefas)) as ex:
-        futuros = {k: ex.submit(fn) for k, fn in tarefas.items()}
+    do_cache = {}  # clima/solo já no cache da célula: lidos aqui, na thread principal, sem consultar
+    for k, (fn, cel) in regionais.items():
+        try: do_cache[k] = fn(*cel, _calc=_so_cache)
+        except _NaoEstaNoCache: tarefas[k] = lambda fn=fn, cel=cel: fn.__wrapped__(*cel)
+    futuros = {}
+    if tarefas:
+        with ThreadPoolExecutor(max_workers=len(tarefas)) as ex:
+            futuros = {k: ex.submit(fn) for k, fn in tarefas.items()}
     d, erros = {}, {}
-    for k, f in futuros.items():  # mesma ordem de antes: clima, terreno, solo, veg
-        try: d[k] = f.result()
-        except Exception as e: d[k] = None; erros[k] = str(e)[:300]
+    for k in ("clima", "terreno", "solo", "veg"):  # mesma ordem de antes
+        if k in do_cache: d[k] = do_cache[k]
+        elif k in futuros:
+            try: d[k] = futuros[k].result()
+            except Exception as e: d[k] = None; erros[k] = str(e)[:300]
+            else:
+                if k in regionais:  # guarda no cache da célula (na thread principal); falha não é guardada
+                    fn, cel = regionais[k]; fn(*cel, _calc=lambda v=d[k]: v)
     if not EE_OK:
         erros["gee"] = EE_ERRO
     d["erros"] = erros
