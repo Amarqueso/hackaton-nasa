@@ -39,6 +39,10 @@ rodam ele inteiro com `streamlit.testing.v1.AppTest` (fixture `app` em `tests/co
   é verificado pelos contadores, não pelo spinner.
 - **Cache**: `st.cache_data`/`st.cache_resource` são globais no processo; a fixture `app` limpa os dois antes e depois
   de cada teste. Dentro de um teste o cache vale entre as execuções, como no servidor.
+- **Cache regional** (#4): clima e solo têm cache por célula (`clima_power(lat, lon)`, `umidade_solo(lat, lon)`, com o
+  centro da célula da POWER, 0,5° × 0,625°, ou do pixel do FLDAS, 0,1°). Dois pontos da mesma célula fazem uma consulta
+  só; para ver qual célula foi consultada, leia `app.get.call_args` (POWER) ou a geometria do ponto na linhagem do
+  FLDAS (`tests/test_cache_regional.py`). Falha não entra no cache da célula.
 
 ## O que não dá para testar aqui
 
