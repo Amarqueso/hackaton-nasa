@@ -152,11 +152,16 @@ def coletar(gj):
         tentar("solo", lambda: umidade_solo(geom))
         tentar("veg", lambda: _ou_none(month_series(lambda s, e: ee.ImageCollection("MODIS/061/MOD13Q1")
                 .filterDate(s, e).select("NDVI").mean(), "NDVI", geom, 250) * 1e-4))
-        tentar("radar", lambda: _ou_none(month_series(lambda s, e: lee(s1(geom).filterDate(s, e).median()).rename("VH"), "VH", geom, 30)))
     else:
         erros["gee"] = EE_ERRO
     d["erros"] = erros
     return d
+
+@st.cache_data(show_spinner=False)
+def radar_vh(gj):
+    """Série mensal do radar Sentinel-1 VH com filtro Lee (só no modo técnico; None se não houver imagem)."""
+    geom = ee.Geometry(json.loads(gj))
+    return _ou_none(month_series(lambda s, e: lee(s1(geom).filterDate(s, e).median()).rename("VH"), "VH", geom, 30))
 
 # ---------------- Recomendação (regras explicáveis) ----------------
 def janela(mes, n): return [(mes - 1 + i) % 12 + 1 for i in range(max(1, min(n, 4)))]
@@ -524,21 +529,28 @@ html(f'<p class="nota"><b>Confiança da sugestão: {conf}.</b> ' + {"alta": "Con
      "(máquinas, mão de obra). Clima e umidade do solo valem para a região, não só para a sua terra. "
      "Converse com um agrônomo ou com a Emater-DF antes de decidir.</p>")
 
+radar, erros = None, dict(d.get("erros", {}))
+if tecnico and EE_OK:  # o radar não entra na recomendação: só é consultado no modo técnico
+    with st.spinner("Carregando o radar…"):
+        try: radar = radar_vh(gj)
+        except Exception as e: erros["radar"] = str(e)[:300]
+
 with st.expander("Parecer técnico (para quem entende do assunto)"):
     fontes = [("Clima (T2M, chuva, UR)", d.get("clima"), "NASA POWER, média mensal 2015–" + str(TODAY.year - 1) + ", ~50 km"),
               ("Altitude e declive", d.get("terreno"), "NASA SRTM, 30 m"),
               ("Umidade do solo 0–10 cm", d.get("solo"), "NASA GLDAS 2.1 Noah, 0,25°; percentil do mês vs. 2010–hoje"),
               ("NDVI mensal", d.get("veg"), "NASA MODIS MOD13Q1, 250 m (últimos 12 meses)"),
-              ("Radar VH com filtro Lee", d.get("radar"), "Sentinel-1 GRD (ESA), 30 m, Lee 5×5, ENL 4,4")]
-    st.dataframe(pd.DataFrame([{"Dado": n, "Disponível": "sim" if v is not None else "NÃO", "Fonte / resolução": f} for n, v, f in fontes]),
+              ("Radar VH com filtro Lee", radar, "Sentinel-1 GRD (ESA), 30 m, Lee 5×5, ENL 4,4")]
+    disp = lambda n, v: "só no modo técnico" if n.startswith("Radar") and not tecnico else "sim" if v is not None else "NÃO"
+    st.dataframe(pd.DataFrame([{"Dado": n, "Disponível": disp(n, v), "Fonte / resolução": f} for n, v, f in fontes]),
                  hide_index=True, width="stretch")
-    for k, e in d.get("erros", {}).items(): st.caption(f"Falha em '{k}': {e}")
+    for k, e in erros.items(): st.caption(f"Falha em '{k}': {e}")
     if d.get("clima"):
         st.markdown("**Clima mensal (média do período)**")
         st.dataframe(pd.DataFrame([{"Mês": MES[m - 1], "T média (°C)": v["t"], "Chuva (mm)": v["chuva"], "UR (%)": v["ur"]}
                                    for m, v in d["clima"].items()]).round(1), hide_index=True, width="stretch")
     if d.get("veg") is not None: st.markdown("**NDVI mensal (MODIS)**"); st.line_chart(d["veg"])
-    if d.get("radar") is not None: st.markdown("**Radar VH filtrado (dB)**"); st.line_chart(d["radar"])
+    if radar is not None: st.markdown("**Radar VH filtrado (dB)**"); st.line_chart(radar)
     st.markdown("**Método.** Ranking por regras (não é modelo treinado): janela de plantio, temperatura média e chuva do ciclo "
                 "(até 4 meses) contra a faixa da cultura; exigência de irrigação; dificuldade vs. experiência; área mínima; objetivo; "
                 "rotação (mesma família penaliza; leguminosa após não leguminosa e gramínea após leguminosa bonificam); declive > 6° favorece "
