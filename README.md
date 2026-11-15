@@ -71,3 +71,5 @@ A aplicação será aberta no navegador.
 2. Informe a rotação de culturas atual.
 3. Selecione sua prioridade.
 4. Consulte a recomendação e os indicadores ambientais.
+
+Uma vez por ano, em janeiro, atualize a climatologia local da NASA POWER com `python scripts/gerar_clima_df.py --ano-fim <ano-anterior>` e versione `data/clima_power_df.json` (a fonte mostra o período gravado no arquivo).

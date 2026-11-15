@@ -122,6 +122,35 @@ class _NaoEstaNoCache(Exception):
 
 def _so_cache(): raise _NaoEstaNoCache
 
+def ler_clima_df():
+    """Lê e valida o arquivo a cada execução: mudanças, ausência e corrupção também invalidam coletar."""
+    try:
+        with open(os.path.join(os.path.dirname(__file__), "data", "clima_power_df.json"), encoding="utf-8") as arquivo:
+            dados = json.load(arquivo)
+        periodo = dados["periodo"]
+        if (type(dados["versao"]) is not int or dados["versao"] != 1 or dados["fonte"] != "NASA POWER"
+                or type(periodo["inicio"]) is not int or periodo["inicio"] != 2015
+                or type(periodo["fim"]) is not int or not 2015 <= periodo["fim"] < TODAY.year
+                or dados["grade"] != {"origem_lat": GRADE_POWER[0][0], "passo_lat": GRADE_POWER[0][1],
+                                     "origem_lon": GRADE_POWER[1][0], "passo_lon": GRADE_POWER[1][1]}
+                or not isinstance(dados["celulas"], dict) or not dados["celulas"]):
+            return None
+        celulas = {}
+        for chave, meses in dados["celulas"].items():
+            coords = tuple(float(x) for x in chave.split(","))
+            if (len(coords) != 2 or not all(math.isfinite(x) for x in coords)
+                    or celula(*coords, GRADE_POWER) != coords or f"{coords[0]:g},{coords[1]:g}" != chave
+                    or set(meses) != {str(m) for m in range(1, 13)}):
+                return None
+            for valores in meses.values():
+                if (not isinstance(valores, dict) or set(valores) != {"t", "chuva", "ur"}
+                        or any(type(v) not in (int, float) or not math.isfinite(v) for v in valores.values())):
+                    return None
+            celulas[chave] = {int(m): valores for m, valores in meses.items()}
+        return {"periodo": periodo, "celulas": celulas}
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError):
+        return None
+
 @st.cache_data(show_spinner=False, persist="disk")
 def clima_power(lat, lon, ano_fim, _calc=None):
     """Clima da célula da POWER com centro (lat, lon), média mensal de 2015 a `ano_fim`. O cache é por célula e
@@ -175,7 +204,7 @@ def umidade_solo(lat, lon, referencia, _calc=None):
 def _ou_none(ser): return None if ser.dropna().empty else ser
 
 @st.cache_data(show_spinner=False)
-def coletar(gj, referencia):
+def coletar(gj, referencia, clima_arquivo):
     """Junta tudo o que o satélite sabe da área. O que falhar fica None (e a tela avisa que não temos o dado).
     As consultas rodam ao mesmo tempo, uma thread por consulta. Nas threads não há nenhuma chamada st.*.
     Clima e solo são regionais e têm cache por célula da grade de cada fonte (ver `_so_cache`): aqui, na thread
@@ -186,7 +215,12 @@ def coletar(gj, referencia):
     lat, lon = centro_de(gj)
     ref = dt.date.fromisoformat(referencia)
     inicio = ref.replace(year=ref.year - 1).isoformat()
-    regionais = {"clima": (clima_power, (*celula(lat, lon, GRADE_POWER), ref.year - 1))}
+    grade_clima = celula(lat, lon, GRADE_POWER)
+    chave_clima = f"{grade_clima[0]:g},{grade_clima[1]:g}"
+    local = clima_arquivo and clima_arquivo["celulas"].get(chave_clima)
+    periodo = clima_arquivo["periodo"] if local else {"inicio": 2015, "fim": ref.year - 1}
+    # O conteúdo validado entra na chave de coletar. Dados locais precedem qualquer cache da API em disco.
+    regionais = {} if local else {"clima": (clima_power, (*grade_clima, ref.year - 1))}
     tarefas = {}
     if EE_OK:
         geom = ee.Geometry(json.loads(gj))
@@ -194,7 +228,7 @@ def coletar(gj, referencia):
         tarefas["terreno"] = lambda: terreno(geom)
         tarefas["veg"] = lambda: _ou_none(month_series(lambda s, e: ee.ImageCollection("MODIS/061/MOD13Q1")
                 .filterDate(s, e).select("NDVI").mean(), "NDVI", geom, 250, inicio) * 1e-4)
-    do_cache = {}  # clima/solo já no cache da célula: lidos aqui, na thread principal, sem consultar
+    do_cache = {"clima": local} if local else {}  # JSON local ou cache regional: nenhuma consulta
     for k, (fn, cel) in regionais.items():
         try: do_cache[k] = fn(*cel, _calc=_so_cache)
         except _NaoEstaNoCache: tarefas[k] = lambda fn=fn, cel=cel: fn.__wrapped__(*cel)
@@ -214,6 +248,7 @@ def coletar(gj, referencia):
     if not EE_OK:
         erros["gee"] = EE_ERRO
     d["erros"] = erros
+    d["clima_periodo"] = periodo
     return d
 
 @st.cache_data(show_spinner=False)
@@ -549,7 +584,7 @@ with right, st.container(border=True):
     ult_nome = st.selectbox("O que plantou por último nesta terra?", [NUNCA, PARADA] + [c["nome"] for c in CAT], key="ult")
 
 with st.spinner("Consultando os satélites… pode levar um minuto."):
-    d = coletar(gj, REFERENCIA)
+    d = coletar(gj, REFERENCIA, ler_clima_df())
 perfil = dict(nivel=NIVEIS[nivel], irriga=AGUA[irriga], obj=OBJ[obj], ha=ha)
 ultimo = POR_NOME.get(ult_nome)
 ok, motivos = ranking(d, perfil, mes, ultimo)
@@ -602,7 +637,8 @@ if tecnico and EE_OK:  # o radar não entra na recomendação: só é consultado
         except Exception as e: erros["radar"] = str(e)[:300]
 
 with st.expander("Parecer técnico (para quem entende do assunto)"):
-    fontes = [("Clima (T2M, chuva, UR)", d.get("clima"), "NASA POWER, média mensal 2015–" + str(TODAY.year - 1) + ", ~50 km"),
+    periodo = d["clima_periodo"]
+    fontes = [("Clima (T2M, chuva, UR)", d.get("clima"), f"NASA POWER, média mensal {periodo['inicio']}–{periodo['fim']}, ~50 km"),
               ("Altitude e declive", d.get("terreno"), "NASA SRTM, 30 m"),
               ("Umidade do solo 0–10 cm", d.get("solo"), "NASA FLDAS Noah, mensal, 0,1° (~11 km); "
                "percentil do último mês vs. o mesmo mês de 2010 até o ano anterior"),

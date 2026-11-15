@@ -1,5 +1,6 @@
 """Fixtures comuns: roda o app.py com AppTest, com Earth Engine e NASA POWER falsos (sem rede)."""
 import contextlib
+import builtins
 import pathlib
 import sys
 from unittest import mock
@@ -97,7 +98,23 @@ def cache_disco(tmp_path, monkeypatch):
 
 
 @pytest.fixture
-def app(fake_ee, cache_disco):
+def arquivo_clima(tmp_path, monkeypatch):
+    """Isola o JSON local. Por padrão não existe, para os testes da API continuarem cobrindo o fallback."""
+    destino = tmp_path / "clima_power_df.json"
+    original = builtins.open
+    caminho_real = pathlib.Path(APP).parent / "data" / "clima_power_df.json"
+
+    def abrir(nome, *args, **kwargs):
+        if isinstance(nome, (str, pathlib.Path)) and pathlib.Path(nome) == caminho_real:
+            nome = destino
+        return original(nome, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", abrir)
+    return destino
+
+
+@pytest.fixture
+def app(fake_ee, cache_disco, arquivo_clima):
     """App com EE falso e POWER falso. Limpa os caches do Streamlit (são globais no processo)."""
     st.cache_data.clear()
     st.cache_resource.clear()
