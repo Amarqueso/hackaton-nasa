@@ -154,19 +154,20 @@ def test_consulta_o_centro_da_celula_que_contem_o_centro_da_terra(app):
     assert solo == [(-15.75, -47.75)]             # pixel lat -15,8..-15,7, lon -47,8..-47,7
 
 
-def test_falha_do_clima_mostra_sem_dado_e_nao_fica_no_cache_da_celula(app):
+def test_falha_do_clima_mostra_sem_dado_e_nao_fica_no_cache_da_celula(app, relogio_fontes):
     app.get.side_effect = requests.ConnectionError("sem internet")
     app.marcar_terra(A)
     tela = dados(app)
     assert all(tela[k] is None for k in CLIMA) and tela[SOLO]
     assert falhas(app) == ["Falha em 'clima': sem internet"]
     app.get.side_effect, app.get.return_value = None, resposta_power()
-    app.marcar_terra(B)  # mesma célula: a falha de A não vale para B
+    relogio_fontes[0] += 121  # #8: a célula compartilha a pausa de retentativa de 120s nesta sessão
+    app.marcar_terra(B)
     assert all(dados(app)[k] for k in CLIMA) and not falhas(app)
     assert app.get.call_count == 2
 
 
-def test_falha_do_solo_mostra_sem_dado(app):
+def test_falha_do_solo_mostra_sem_dado(app, relogio_fontes):
     def falha():
         raise RuntimeError("Computation timed out.")
     app.ee.respostas["FLDAS"] = falha
@@ -175,6 +176,7 @@ def test_falha_do_solo_mostra_sem_dado(app):
     assert tela[SOLO] is None and all(tela[k] for k in CLIMA)
     assert falhas(app) == ["Falha em 'solo': Computation timed out."]
     app.ee.respostas["FLDAS"] = lambda: serie_mensal(lambda a, m: 0.2)
+    relogio_fontes[0] += 121
     app.marcar_terra(B)
     assert app.ee.chamadas["FLDAS"] == 2 and not falhas(app)
 

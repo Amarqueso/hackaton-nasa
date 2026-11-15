@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 load_dotenv()
 import os, json, math, datetime as dt
 from concurrent.futures import ThreadPoolExecutor
+from time import monotonic
 import ee, folium, pandas as pd, requests, streamlit as st
 from folium.plugins import Draw
 from streamlit_folium import st_folium
@@ -118,12 +119,12 @@ def celula(lat, lon, grade):
     return float(c(lat, b_lat, p_lat)), float(c(lon, b_lon, p_lon))
 
 class _NaoEstaNoCache(Exception):
-    """Levantada por `_so_cache`: a função regional foi chamada só para ler o cache."""
+    """Levantada por `_so_cache`: a fonte foi chamada só para ler o cache."""
 
 def _so_cache(): raise _NaoEstaNoCache
 
 def ler_clima_df():
-    """Lê e valida o arquivo a cada execução: mudanças, ausência e corrupção também invalidam coletar."""
+    """Lê e valida a cada execução, sem esconder mudanças, ausência ou corrupção no cache."""
     try:
         with open(os.path.join(os.path.dirname(__file__), "data", "clima_power_df.json"), encoding="utf-8") as arquivo:
             dados = json.load(arquivo)
@@ -171,7 +172,10 @@ def clima_power(lat, lon, ano_fim, _calc=None):
         out[m] = dict(t=med("T2M", m), chuva=None if ch is None else ch * DIAS[m - 1], ur=med("RH2M", m))
     return out
 
-def terreno(geom):
+@st.cache_data(show_spinner=False)
+def terreno(gj, _calc=None):
+    if _calc: return _calc()
+    geom = ee.Geometry(json.loads(gj))
     e = ee.Image("USGS/SRTMGL1_003")
     r = e.addBands(ee.Terrain.slope(e)).reduceRegion(ee.Reducer.mean(), geom, 30, maxPixels=1e9).getInfo()
     return dict(alt=r["elevation"], decl=r["slope"])
@@ -204,47 +208,68 @@ def umidade_solo(lat, lon, referencia, _calc=None):
 def _ou_none(ser): return None if ser.dropna().empty else ser
 
 @st.cache_data(show_spinner=False)
-def coletar(gj, referencia, clima_arquivo):
-    """Junta tudo o que o satélite sabe da área. O que falhar fica None (e a tela avisa que não temos o dado).
-    As consultas rodam ao mesmo tempo, uma thread por consulta. Nas threads não há nenhuma chamada st.*.
-    Clima e solo são regionais e têm cache por célula da grade de cada fonte (ver `_so_cache`): aqui, na thread
-    principal, cada um é lido do cache da célula; se não estiver lá, a thread roda a função sem o cache
-    (`__wrapped__`) e o resultado é guardado no cache da célula depois, também aqui. Terreno e NDVI dependem da
-    terra exata e ficam no cache de coletar (por gj e mês). d/erros são montados na thread principal.
-    O Earth Engine usa a sessão aberta uma vez em init_ee."""
-    lat, lon = centro_de(gj)
+def ndvi(gj, referencia, _calc=None):
+    if _calc: return _calc()
+    geom = ee.Geometry(json.loads(gj))
     ref = dt.date.fromisoformat(referencia)
     inicio = ref.replace(year=ref.year - 1).isoformat()
+    return _ou_none(month_series(lambda s, e: ee.ImageCollection("MODIS/061/MOD13Q1")
+                    .filterDate(s, e).select("NDVI").mean(), "NDVI", geom, 250, inicio) * 1e-4)
+
+def tentar(fontes):
+    """Sucessos (inclusive None) ficam no cache de cada fonte. Falhas ficam só nesta sessão por 120s desde a
+    conclusão, por fonte e argumentos (célula para clima/solo). Apenas misses sem pausa rodam em paralelo.
+    Todas as leituras/escritas st.* ficam aqui, na thread principal; workers chamam somente __wrapped__."""
+    falhas = st.session_state.setdefault("falhas_fontes", {})
+    agora = monotonic()
+    for chave, (quando, erro) in list(falhas.items()):
+        if agora - quando >= 120:
+            del falhas[chave]
+    d, erros, tarefas = {}, {}, {}
+    for k, (fn, args) in fontes.items():
+        try:
+            d[k] = fn(*args, _calc=_so_cache)
+            falhas.pop((k, args), None)  # outra sessão pode já ter recuperado esta fonte
+        except _NaoEstaNoCache:
+            falha = falhas.get((k, args))
+            if falha:
+                d[k], erros[k] = None, falha[1]
+            else:
+                tarefas[k] = (fn, args)
+    if tarefas:
+        with ThreadPoolExecutor(max_workers=len(tarefas)) as ex:
+            futuros = {k: ex.submit(fn.__wrapped__, *args) for k, (fn, args) in tarefas.items()}
+        for k, futuro in futuros.items():
+            fn, args = tarefas[k]
+            try: d[k] = futuro.result()
+            except Exception as e:
+                d[k] = None
+                erros[k] = str(e)[:300]
+                falhas[(k, args)] = (monotonic(), erros[k])
+            else:
+                fn(*args, _calc=lambda valor=d[k]: valor)
+                falhas.pop((k, args), None)
+    return d, erros
+
+def coletar(gj, referencia, clima_arquivo):
+    """Junta tudo o que o satélite sabe da área. O que falhar fica None (e a tela avisa que não temos o dado).
+    Não cacheia resultados agregados: `tentar` lê sucessos por fonte e controla o intervalo das falhas.
+    Clima local precede a API; clima/solo usam sua grade, terreno a geometria e séries a referência mensal."""
+    lat, lon = centro_de(gj)
+    ref = dt.date.fromisoformat(referencia)
     grade_clima = celula(lat, lon, GRADE_POWER)
     chave_clima = f"{grade_clima[0]:g},{grade_clima[1]:g}"
     local = clima_arquivo and clima_arquivo["celulas"].get(chave_clima)
     periodo = clima_arquivo["periodo"] if local else {"inicio": 2015, "fim": ref.year - 1}
-    # O conteúdo validado entra na chave de coletar. Dados locais precedem qualquer cache da API em disco.
-    regionais = {} if local else {"clima": (clima_power, (*grade_clima, ref.year - 1))}
-    tarefas = {}
+    # Sem cache agregado, o arquivo validado mais recente é usado mesmo após erros ou cache antigo da API.
+    fontes = {} if local else {"clima": (clima_power, (*grade_clima, ref.year - 1))}
     if EE_OK:
-        geom = ee.Geometry(json.loads(gj))
-        regionais["solo"] = (umidade_solo, (*celula(lat, lon, GRADE_FLDAS), referencia))
-        tarefas["terreno"] = lambda: terreno(geom)
-        tarefas["veg"] = lambda: _ou_none(month_series(lambda s, e: ee.ImageCollection("MODIS/061/MOD13Q1")
-                .filterDate(s, e).select("NDVI").mean(), "NDVI", geom, 250, inicio) * 1e-4)
-    do_cache = {"clima": local} if local else {}  # JSON local ou cache regional: nenhuma consulta
-    for k, (fn, cel) in regionais.items():
-        try: do_cache[k] = fn(*cel, _calc=_so_cache)
-        except _NaoEstaNoCache: tarefas[k] = lambda fn=fn, cel=cel: fn.__wrapped__(*cel)
-    futuros = {}
-    if tarefas:
-        with ThreadPoolExecutor(max_workers=len(tarefas)) as ex:
-            futuros = {k: ex.submit(fn) for k, fn in tarefas.items()}
-    d, erros = {}, {}
-    for k in ("clima", "terreno", "solo", "veg"):  # mesma ordem de antes
-        if k in do_cache: d[k] = do_cache[k]
-        elif k in futuros:
-            try: d[k] = futuros[k].result()
-            except Exception as e: d[k] = None; erros[k] = str(e)[:300]
-            else:
-                if k in regionais:  # guarda no cache da célula (na thread principal); falha não é guardada
-                    fn, cel = regionais[k]; fn(*cel, _calc=lambda v=d[k]: v)
+        fontes["terreno"] = (terreno, (gj,))
+        fontes["solo"] = (umidade_solo, (*celula(lat, lon, GRADE_FLDAS), referencia))
+        fontes["veg"] = (ndvi, (gj, referencia))
+    d, erros = tentar(fontes)
+    if local: d["clima"] = local
+    d = {k: d[k] for k in ("clima", "terreno", "solo", "veg") if k in d}  # mesma ordem de antes
     if not EE_OK:
         erros["gee"] = EE_ERRO
     d["erros"] = erros
@@ -252,8 +277,9 @@ def coletar(gj, referencia, clima_arquivo):
     return d
 
 @st.cache_data(show_spinner=False)
-def radar_vh(gj, referencia):
+def radar_vh(gj, referencia, _calc=None):
     """Série mensal do radar Sentinel-1 VH com filtro Lee (só no modo técnico; None se não houver imagem)."""
+    if _calc: return _calc()
     geom = ee.Geometry(json.loads(gj))
     ref = dt.date.fromisoformat(referencia)
     inicio = ref.replace(year=ref.year - 1).isoformat()
@@ -674,8 +700,9 @@ carregar_camadas()  # antes do radar, para o mapa ganhar as camadas o quanto ant
 radar, erros = None, dict(d.get("erros", {}))
 if tecnico and EE_OK:  # o radar não entra na recomendação: só é consultado no modo técnico
     with st.spinner("Carregando o radar…"):
-        try: radar = radar_vh(gj, REFERENCIA)
-        except Exception as e: erros["radar"] = str(e)[:300]
+        dados_radar, falhas_radar = tentar({"radar": (radar_vh, (gj, REFERENCIA))})
+        radar = dados_radar["radar"]
+        erros.update(falhas_radar)
 
 with st.expander("Parecer técnico (para quem entende do assunto)"):
     periodo = d["clima_periodo"]

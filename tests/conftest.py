@@ -114,6 +114,13 @@ def arquivo_clima(tmp_path, monkeypatch):
 
 
 @pytest.fixture
+def relogio_fontes(monkeypatch):
+    agora = [1000.0]
+    monkeypatch.setattr("time.monotonic", lambda: agora[0])
+    return agora
+
+
+@pytest.fixture
 def app(fake_ee, cache_disco, arquivo_clima):
     """App com EE falso e POWER falso. Limpa os caches do Streamlit (são globais no processo)."""
     st.cache_data.clear()
