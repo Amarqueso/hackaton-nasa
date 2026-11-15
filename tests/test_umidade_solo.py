@@ -5,7 +5,7 @@ from fake_ee import SEM_V, serie_mensal
 from test_coletar import dados
 
 SOLO = "Umidade do solo 0–10 cm"
-LINHA = "Umidade do solo agora"
+LINHA = "Umidade do solo"
 
 
 def solo(app, valor, **kw):
@@ -30,7 +30,7 @@ def test_linha_mostra_uma_das_quatro_classes(app, abaixo, classe):
     # 2010-2025: 16 setembros; o de 2026 (último mês) fica acima de `abaixo` deles
     solo(app, lambda a, m: abaixo - 0.5 if a == 2026 else float(a - 2010))
     app.marcar_terra((-15.68, -48.20))  # perto de Brazlândia
-    assert dados(app)[LINHA] == classe
+    assert dados(app)[LINHA] == classe + " (setembro de 2026)"
     assert not falhas(app)
 
 
@@ -38,7 +38,7 @@ def test_uma_unica_consulta_ao_earth_engine(app):
     app.marcar_terra()
     assert app.ee.chamadas["FLDAS"] == 1
     assert app.ee.chamadas["GLDAS"] == 0
-    assert dados(app)[LINHA] == "Normal"
+    assert dados(app)[LINHA] == "Normal (setembro de 2026)"
 
 
 def test_textos_de_fonte_e_metodo(app):
@@ -63,7 +63,7 @@ def test_mes_recente_nao_publicado_usa_o_ultimo_com_dado(app):
         return 0.90
     solo(app, valor, ate=(2026, 11))
     app.marcar_terra()
-    assert dados(app)[LINHA] == "Bem mais seca que o normal"
+    assert dados(app)[LINHA] == "Bem mais seca que o normal (setembro de 2026)"
     assert not falhas(app)
     assert app.fontes()[SOLO] == "sim"
 
@@ -83,7 +83,7 @@ def test_anos_sem_dado_no_mes_sao_ignorados(app):
     solo(app, valor)
     app.marcar_terra()
     # se os anos sem dado contassem como 0 (ou abaixo), seriam 11/16 -> "Mais úmida"; ignorados, 5/10 -> "Normal"
-    assert dados(app)[LINHA] == "Normal"
+    assert dados(app)[LINHA] == "Normal (setembro de 2026)"
     assert not falhas(app)
 
 
@@ -96,7 +96,7 @@ def test_ultimo_dado_do_ano_anterior_nao_e_comparado_com_ele_mesmo(app):
     solo(app, valor, ate=(2025, 12))
     app.marcar_terra()
     # 6/15 = 0,4 -> "Normal"; se 2025 entrasse na base seria 6/16 = 0,375 -> "Um pouco mais seca"
-    assert dados(app)[LINHA] == "Normal"
+    assert dados(app)[LINHA] == "Normal (dezembro de 2025)"
 
 
 def test_ponto_sem_dado_mostra_sem_dado_e_confianca_media(app):
@@ -108,3 +108,27 @@ def test_ponto_sem_dado_mostra_sem_dado_e_confianca_media(app):
     assert app.fontes()[SOLO] == "NÃO"
     assert any("Confiança da sugestão: média" in t for t in app.recomendacao())
     assert not falhas(app)
+
+
+@pytest.mark.parametrize("mes, nome", [(1, "janeiro"), (3, "março"), (11, "novembro"), (12, "dezembro")])
+def test_linha_identifica_o_mes_do_dado_e_preserva_a_confianca(app, mes, nome):
+    """O último mês disponível, inclusive o atual, é identificado sem mudar a avaliação."""
+    solo(app, lambda a, m: 0.5 if a == 2026 else (0.4 if a % 2 else 0.6), ate=(2026, mes))
+    app.marcar_terra()
+    assert dados(app)[LINHA] == f"Normal ({nome} de 2026)"
+    assert not any("Umidade do solo agora" in texto for texto in app.textos())
+    assert app.fontes()[SOLO] == "sim"
+    assert any("Confiança da sugestão: alta" in texto for texto in app.recomendacao())
+
+
+def test_mes_de_referencia_nao_muda_a_recomendacao(app):
+    solo(app, lambda a, m: 0.5 if a == 2026 else (0.4 if a % 2 else 0.6), ate=(2026, 9))
+    app.marcar_terra()
+    antes = [t for t in app.recomendacao() if 'class="dados"' not in t]
+    solo(app, lambda a, m: 0.5 if a == 2026 else (0.4 if a % 2 else 0.6), ate=(2026, 11))
+    import streamlit as st
+    st.cache_data.clear()
+    app.run()
+    depois = [t for t in app.recomendacao() if 'class="dados"' not in t]
+    assert dados(app)[LINHA] == "Normal (novembro de 2026)"
+    assert antes == depois

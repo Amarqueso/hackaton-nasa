@@ -571,8 +571,9 @@ html('<dl class="dados">' + "".join([
     dado("Umidade do ar", cj and cj["ur"] is not None and f"{cj['ur']:.0f}%", nasa),
     dado("Altitude", t and f"{t['alt']:.0f} m", "NASA SRTM, 30 metros"),
     dado("Terreno", t and ("Plano" if t["decl"] <= 3 else "Inclinado" if t["decl"] <= 6 else "Muito inclinado"), "NASA SRTM, 30 metros"),
-    dado("Umidade do solo agora", s and ("Bem mais seca que o normal" if s["pct"] < 0.25 else "Um pouco mais seca que o normal"
-         if s["pct"] < 0.4 else "Normal" if s["pct"] <= 0.6 else "Mais úmida que o normal"), "NASA FLDAS, ~11 km, vale para a região"),
+    dado("Umidade do solo", s and ("Bem mais seca que o normal" if s["pct"] < 0.25 else "Um pouco mais seca que o normal"
+         if s["pct"] < 0.4 else "Normal" if s["pct"] <= 0.6 else "Mais úmida que o normal")
+         + f" ({MES[s['mes'] - 1]} de {s['ano']})", "NASA FLDAS, ~11 km, vale para a região"),
     dado("Meses com pouca planta no último ano", veg is not None and f"{int((veg < 0.3).sum())} de 12", "NASA MODIS, 250 metros")]) + "</dl>")
 conf = confianca(d)
 html(f'<p class="nota"><b>Confiança da sugestão: {conf}.</b> ' + {"alta": "Conseguimos todos os dados.",

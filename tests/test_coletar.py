@@ -104,7 +104,7 @@ def test_falha_na_power_nao_derruba_as_outras(app):
     tela = dados(app)
     assert tela["Temperatura nos próximos meses"] is None
     assert tela["Chuva esperada em 4 meses"] is None
-    assert tela["Altitude"] == "1100 m" and tela["Terreno"] and tela["Umidade do solo agora"]
+    assert tela["Altitude"] == "1100 m" and tela["Terreno"] and tela["Umidade do solo"]
     assert tela["Meses com pouca planta no último ano"]
     assert "Falha em 'clima': sem internet" in app.legendas()
     assert app.fontes()["Clima (T2M, chuva, UR)"] == "NÃO"
@@ -117,7 +117,7 @@ def test_falha_no_earth_engine_nao_derruba_as_outras(app):
     app.marcar_terra()
     tela = dados(app)
     assert tela["Altitude"] is None and tela["Terreno"] is None
-    assert tela["Temperatura nos próximos meses"] and tela["Umidade do solo agora"]
+    assert tela["Temperatura nos próximos meses"] and tela["Umidade do solo"]
     assert tela["Meses com pouca planta no último ano"]
     assert [c for c in app.legendas() if c.startswith("Falha em")] == ["Falha em 'terreno': Computation timed out."]
 
@@ -140,7 +140,7 @@ def test_timeout_da_power_nao_perde_o_earth_engine(app):
     app.get.side_effect = power
     app.marcar_terra()
     tela = dados(app)
-    assert tela["Altitude"] == "1100 m" and tela["Terreno"] and tela["Umidade do solo agora"]
+    assert tela["Altitude"] == "1100 m" and tela["Terreno"] and tela["Umidade do solo"]
     assert tela["Meses com pouca planta no último ano"]
     assert [rot for rot, v in tela.items() if v is None] == [
         "Temperatura nos próximos meses", "Chuva esperada em 4 meses", "Umidade do ar"]
