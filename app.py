@@ -123,19 +123,24 @@ def terreno(geom):
     return dict(alt=r["elevation"], decl=r["slope"])
 
 def umidade_solo(geom):
-    """Umidade do solo (0-10 cm, NASA GLDAS, ~25 km): último mês disponível vs. o mesmo mês em 2010-hoje."""
-    ponto, banda = geom.centroid(1), "SoilMoi0_10cm_inst"
-    col = ee.ImageCollection("NASA/GLDAS/V021/NOAH/G025/T3H").select(banda)
-    ser = month_series(lambda s, e: col.filterDate(s, e).mean(), banda, ponto, 27830).dropna()
-    if ser.empty: return None
-    mes, atual = int(ser.index[-1][5:]), float(ser.iloc[-1])
-    def f(y):
-        s = ee.Date.fromYMD(y, mes, 1)
-        v = col.filterDate(s, s.advance(1, "month")).mean().reduceRegion(ee.Reducer.mean(), ponto, 27830).get(banda, -9999)
-        return ee.Feature(None, {"v": v})
-    feats = ee.FeatureCollection(ee.List.sequence(2010, TODAY.year - 1).map(f)).getInfo()["features"]
-    vals = [x["properties"]["v"] for x in feats if x["properties"].get("v") is not None and x["properties"]["v"] > -9000]
-    return dict(pct=sum(v < atual for v in vals) / len(vals), mes=mes) if vals else None
+    """Umidade do solo (0-10 cm, NASA FLDAS, mensal, 0,1° ≈ 11 km): último mês publicado vs. o mesmo mês de 2010 até
+    o ano anterior ao dele. A série inteira vem num único getInfo e o percentil é calculado aqui."""
+    ponto, banda = geom.centroid(1), "SoilMoi00_10cm_tavg"
+    col = (ee.ImageCollection("NASA/FLDAS/NOAH01/C/GL/M/V001").select(banda)
+           .filterDate("2010-01-01", (TODAY + dt.timedelta(days=1)).isoformat()))
+    feats = ee.FeatureCollection(col.map(lambda img: ee.Feature(None, {
+        "m": img.date().format("YYYY-MM"),
+        "v": img.reduceRegion(ee.Reducer.mean(), ponto, 11132).get(banda)}))).getInfo()["features"]
+    serie = {}  # (ano, mês) -> valor; meses sem dado (pixel mascarado, ex.: água) ficam de fora
+    for x in feats:
+        m, v = x["properties"].get("m"), x["properties"].get("v")
+        if m and v is not None and v == v and v > -9000:
+            serie[(int(m[:4]), int(m[5:7]))] = float(v)
+    if not serie: return None
+    ano, mes = max(serie)
+    atual = serie[(ano, mes)]
+    vals = [v for (a, m), v in serie.items() if m == mes and 2010 <= a < ano]  # anos sem dado no mês são ignorados
+    return dict(pct=sum(v < atual for v in vals) / len(vals), mes=mes, ano=ano) if vals else None
 
 def _ou_none(ser): return None if ser.dropna().empty else ser
 
@@ -526,7 +531,7 @@ html('<dl class="dados">' + "".join([
     dado("Altitude", t and f"{t['alt']:.0f} m", "NASA SRTM, 30 metros"),
     dado("Terreno", t and ("Plano" if t["decl"] <= 3 else "Inclinado" if t["decl"] <= 6 else "Muito inclinado"), "NASA SRTM, 30 metros"),
     dado("Umidade do solo agora", s and ("Bem mais seca que o normal" if s["pct"] < 0.25 else "Um pouco mais seca que o normal"
-         if s["pct"] < 0.4 else "Normal" if s["pct"] <= 0.6 else "Mais úmida que o normal"), "NASA GLDAS, vale para a região"),
+         if s["pct"] < 0.4 else "Normal" if s["pct"] <= 0.6 else "Mais úmida que o normal"), "NASA FLDAS, ~11 km, vale para a região"),
     dado("Meses com pouca planta no último ano", veg is not None and f"{int((veg < 0.3).sum())} de 12", "NASA MODIS, 250 metros")]) + "</dl>")
 conf = confianca(d)
 html(f'<p class="nota"><b>Confiança da sugestão: {conf}.</b> ' + {"alta": "Conseguimos todos os dados.",
@@ -545,7 +550,8 @@ if tecnico and EE_OK:  # o radar não entra na recomendação: só é consultado
 with st.expander("Parecer técnico (para quem entende do assunto)"):
     fontes = [("Clima (T2M, chuva, UR)", d.get("clima"), "NASA POWER, média mensal 2015–" + str(TODAY.year - 1) + ", ~50 km"),
               ("Altitude e declive", d.get("terreno"), "NASA SRTM, 30 m"),
-              ("Umidade do solo 0–10 cm", d.get("solo"), "NASA GLDAS 2.1 Noah, 0,25°; percentil do mês vs. 2010–hoje"),
+              ("Umidade do solo 0–10 cm", d.get("solo"), "NASA FLDAS Noah, mensal, 0,1° (~11 km); "
+               "percentil do último mês vs. o mesmo mês de 2010 até o ano anterior"),
               ("NDVI mensal", d.get("veg"), "NASA MODIS MOD13Q1, 250 m (últimos 12 meses)"),
               ("Radar VH com filtro Lee", radar, "Sentinel-1 GRD (ESA), 30 m, Lee 5×5, ENL 4,4")]
     disp = lambda n, v: "só no modo técnico" if n.startswith("Radar") and not tecnico else "sim" if v is not None else "NÃO"
@@ -563,4 +569,4 @@ with st.expander("Parecer técnico (para quem entende do assunto)"):
                 "rotação (mesma família penaliza; leguminosa após não leguminosa e gramínea após leguminosa bonificam); declive > 6° favorece "
                 "culturas de cobertura; umidade do solo abaixo do percentil 30 (sem irrigação). NDVI e filtro Lee seguem os notebooks "
                 "NDVI/GEE_multiplas_datas e Lee_filter do curso. As faixas e janelas das culturas são referência agronômica geral e "
-                "precisam de validação (Emater-DF, Embrapa Hortaliças/Cerrados). Clima e solo têm resolução (25–50 km) maior que a terra.")
+                "precisam de validação (Emater-DF, Embrapa Hortaliças/Cerrados). Clima e solo têm resolução (10–50 km) maior que a terra.")
