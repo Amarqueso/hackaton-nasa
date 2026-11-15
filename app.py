@@ -4,9 +4,9 @@ Rodar: earthengine authenticate ; streamlit run app.py   (.env: GEE_PROJECT=seu-
 """
 from dotenv import load_dotenv
 load_dotenv()
-import os, json, math, threading, datetime as dt
+import os, json, math, inspect, tempfile, threading, datetime as dt
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
-from time import monotonic
+from time import monotonic, time
 import ee, folium, pandas as pd, requests, streamlit as st
 from folium.plugins import Draw
 from streamlit_folium import st_folium
@@ -14,6 +14,51 @@ from streamlit_folium import st_folium
 st.set_page_config(page_title="RotaDF", layout="wide", initial_sidebar_state="collapsed")
 
 EE_PRAZO, EE_PAUSA = 30, 120  # s: desiste do Initialize; não tenta de novo depois de uma falha (#19)
+EE_DISCOVERY_IDADE = 24 * 3600  # s: idade máxima do discovery da API do Earth Engine salvo em disco (#22)
+
+def instalar_cache_discovery():
+    """O `ee` monta os clientes com `cache_discovery=False` e baixa o discovery da API duas vezes a cada Initialize
+    (#22). Guarda o documento em memória e em `$ROTADF_CACHE/ee_discovery.json` por EE_DISCOVERY_IDADE s. O hook é no
+    `_retrieve_discovery_doc` (privado) do googleapiclient: se ele sumir ou mudar de assinatura, segue sem cache.
+    Qualquer erro de leitura cai no download normal; erro de gravação é ignorado."""
+    from googleapiclient import discovery
+    original = getattr(discovery, "_retrieve_discovery_doc", None)
+    if original is None or getattr(original, "rotadf", False): return  # o script roda de novo a cada rerun
+    try:
+        if list(inspect.signature(original).parameters)[:2] != ["url", "http"]: return
+    except (TypeError, ValueError): return
+    trava, memoria = threading.Lock(), {}
+
+    def retrieve(url, http, *a, **kw):
+        if "earthengine.googleapis.com" not in url or "$discovery" not in url:
+            return original(url, http, *a, **kw)
+        arquivo = os.path.join(os.environ.get("ROTADF_CACHE") or os.path.expanduser("~/.cache/rotadf"), "ee_discovery.json")
+        with trava:  # duas tentativas ao mesmo tempo: a segunda espera e lê o que a primeira baixou
+            if url in memoria and time() - memoria[url][0] < EE_DISCOVERY_IDADE:
+                return memoria[url][1]
+            try:
+                quando = os.path.getmtime(arquivo)
+                with open(arquivo, encoding="utf-8") as f: salvo = json.load(f)
+                if salvo["url"] == url and time() - quando < EE_DISCOVERY_IDADE:
+                    json.loads(salvo["doc"])
+                    memoria[url] = (quando, salvo["doc"])
+                    return salvo["doc"]
+            except (OSError, ValueError, KeyError, TypeError):
+                pass
+            doc = original(url, http, *a, **kw)
+            memoria[url] = (time(), doc)
+            try:
+                os.makedirs(os.path.dirname(arquivo), exist_ok=True)
+                with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=os.path.dirname(arquivo), delete=False) as f:
+                    json.dump({"url": url, "doc": doc}, f)
+                os.replace(f.name, arquivo)  # atômico: quem lê nunca vê um arquivo pela metade
+            except OSError:
+                pass
+            return doc
+
+    retrieve.rotadf = True
+    discovery._retrieve_discovery_doc = retrieve
+instalar_cache_discovery()
 
 @st.cache_resource(show_spinner=False)
 def _estado_ee():
