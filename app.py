@@ -386,8 +386,11 @@ def construir_mapa(gj, urls, desenho):
 
 # ---------------- Interface ----------------
 import html as _h
+# Fontes servidas pelo próprio app (static/, `enableStaticServing`), sem Google Fonts (#12): só o subconjunto
+# latino do Google Fonts (acentos do português), licença SIL OFL em static/OFL-*.txt.
 CSS = """
-@import url('https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Public+Sans:wght@400;500;600&display=swap');
+@font-face{font-family:'Bricolage Grotesque';font-style:normal;font-weight:500 700;font-display:swap;src:url('app/static/BricolageGrotesque-latin.woff2') format('woff2');unicode-range:U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD}
+@font-face{font-family:'Public Sans';font-style:normal;font-weight:400 600;font-display:swap;src:url('app/static/PublicSans-latin.woff2') format('woff2');unicode-range:U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD}
 :root{--bg:#F2F4F1;--papel:#fff;--tinta:#16241D;--verde:#1D4D3B;--verde-cl:#DDE8E0;--ipe:#E8B000;--terra:#9C4A2F;--linha:#D9DFDA;--mut:#5F6B64}
 .stApp{background:var(--bg);color:var(--tinta)}
 .stApp,.stMarkdown,.stMarkdown p,label,button,input,[data-baseweb]{font-family:'Public Sans',system-ui,sans-serif}

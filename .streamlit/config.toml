@@ -6,5 +6,8 @@ secondaryBackgroundColor = "#E6ECE7"
 textColor = "#16241D"
 font = "sans-serif"
 
+[server]
+enableStaticServing = true  # fontes em static/, servidas em app/static/ (#12)
+
 [browser]
 gatherUsageStats = false
