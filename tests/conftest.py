@@ -1,6 +1,7 @@
 """Fixtures comuns: roda o app.py com AppTest, com Earth Engine e NASA POWER falsos (sem rede)."""
 import contextlib
 import builtins
+import inspect
 import pathlib
 import sys
 import types
@@ -65,17 +66,25 @@ class App:
         return self
 
     def fragmentos(self):
-        """Ids dos fragmentos (`st.fragment`) registrados na última execução."""
-        return list(self.at._fragment_storage._fragments)
+        """{nome da função: id} dos fragmentos (`st.fragment`) registrados na última execução: "mapa" e "passo2"."""
+        out = {}
+        for fid, f in self.at._fragment_storage._fragments.items():
+            func = inspect.getclosurevars(f).nonlocals["non_optional_func"]
+            out[func.__name__] = fid
+        return out
 
-    def rodar_sozinho(self):
-        """Simula o `run_every` de um fragmento numa aba parada (#15): o navegador pede para rodar só o fragmento
-        (`is_auto_rerun`), sem a página inteira. Depois disso `self.at` só tem o que o fragmento desenhou."""
-        ids, real = self.fragmentos(), local_script_runner.RerunData
-        assert len(ids) == 1, ids
-        rerun = lambda **kw: real(fragment_id_queue=ids, is_auto_rerun=True, **kw)
+    def rodar_fragmento(self, nome, auto=False):
+        """Roda só o fragmento `nome`, como o navegador pede: ao mexer num widget dele (`auto=False`) ou pelo
+        `run_every` (`auto=True`). Depois disso `self.at` só tem o que o fragmento desenhou."""
+        ids, real = [self.fragmentos()[nome]], local_script_runner.RerunData
+        rerun = lambda **kw: real(fragment_id_queue=ids, is_auto_rerun=auto, **kw)
         with mock.patch.object(local_script_runner, "RerunData", rerun):
             return self.run()
+
+    def rodar_sozinho(self):
+        """Simula o `run_every` do mapa numa aba parada (#15): o navegador pede para rodar só o fragmento do mapa
+        (`is_auto_rerun`), sem a página inteira."""
+        return self.rodar_fragmento("mapa", auto=True)
 
     def marcar_terra(self, ponto=PONTO_DF):
         self.at.session_state["centro"] = ponto

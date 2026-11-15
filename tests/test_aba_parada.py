@@ -38,11 +38,12 @@ def componente():
 
 @pytest.fixture
 def run_every():
-    """run_every de cada st.fragment da página, em ordem."""
+    """run_every do fragmento do mapa, em ordem (o do passo 2, #6, nunca roda sozinho)."""
     pedidos, real = [], st.fragment
 
     def fragment(func=None, **kw):
-        pedidos.append(kw.get("run_every"))
+        if getattr(func, "__name__", None) == "mapa":
+            pedidos.append(kw.get("run_every"))
         return real(func, **kw)
 
     with mock.patch("streamlit.fragment", fragment):

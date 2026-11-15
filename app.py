@@ -669,6 +669,72 @@ def carregar_camadas():
     except Exception: aviso.caption(aviso_camadas(CAMADAS)); return  # não deveria acontecer: layers não levanta
     st.rerun()
 
+resultados = st.empty()  # abaixo do mapa e da coluna da direita; o fragmento do passo 2 escreve aqui (#6)
+
+def passo2(gj, ha, area, dados):
+    """Passo 2 e resultados (#6). É um fragmento: mudar uma resposta roda só ele, e o mapa (outro fragmento) não é
+    reconstruído nem mandado de novo ao navegador. Os widgets ficam dentro do fragmento (coluna da direita); os
+    resultados não têm widgets e vão para `area`, um `st.empty` criado fora, que cada volta substitui (não acumula).
+    O que muda a terra fica fora, no passo 1 e no mapa, e roda a página inteira. `dados` é criado a cada execução
+    completa: ela guarda ali o `coletar` (com o aviso de consulta), e as voltas só do fragmento reaproveitam o mesmo."""
+    html('<div class="passo"><b>2</b><span>Conte um pouco sobre você</span></div>')
+    nivel = escolha("Você já plantou antes?", list(NIVEIS), "nivel")
+    irriga = escolha("Tem água para irrigar?", list(AGUA), "agua")
+    obj = escolha("O que você quer?", list(OBJ), "obj")
+    mes = st.selectbox("Quando pretende plantar?", list(range(1, 13)), index=TODAY.month - 1, key="mes",
+                       format_func=lambda m: MES[m - 1].capitalize() + (" (este mês)" if m == TODAY.month else ""))
+    ult_nome = st.selectbox("O que plantou por último nesta terra?", [NUNCA, PARADA] + [c["nome"] for c in CAT], key="ult")
+    with area.container():
+        if "d" not in dados:
+            with st.spinner("Consultando os satélites… pode levar um minuto."):
+                dados["d"] = coletar(gj, REFERENCIA, ler_clima_df())
+        resultado(dados["d"], dict(nivel=NIVEIS[nivel], irriga=AGUA[irriga], obj=OBJ[obj], ha=ha), mes, POR_NOME.get(ult_nome))
+
+def resultado(d, perfil, mes, ultimo):
+    """Recomendação, plano de rotação e o que sabemos sobre a terra (só elementos sem interação)."""
+    ok, motivos = ranking(d, perfil, mes, ultimo)
+
+    html(f'<h2 class="sec">O que combina com a sua terra em {MES[mes - 1]}</h2>')
+    if not ok:
+        html('<p class="nota">Nada combina bem com a sua terra nesta época. ' + (
+            "Sem irrigação a chuva não é suficiente e várias culturas dessa época precisam de água. Tente outro mês ou veja se dá para irrigar."
+            if not perfil["irriga"] else "Tente outro mês.") + "</p>")
+    else:
+        html(destaque(ok[0], mes))
+        if len(ok) > 1:
+            html("<div>" + "".join(linha(r) for r in ok[1:4]) + "</div>")
+        if len(ok) > 4:
+            html('<p class="mut">Também possível: ' + esc(", ".join(r["nome"] for r in ok[4:7])) + ".</p>")
+
+    html('<h2 class="sec">E depois? Um plano de rotação</h2>')
+    seq = plano(d, perfil, mes, ultimo)
+    html('<ol class="trilha">' + "".join(
+        f'<li><time>{MES[mm - 1]}</time><b>{esc(r["nome"])}</b><span>{esc(r["bom"][0] if r["bom"] else r["desc"])}</span>'
+        + (f"<em>A terra descansa {e} mês(es) antes.</em>" if e else "") + "</li>" for mm, r, e in seq) + "</ol>")
+    html('<p class="mut">A ideia é alternar famílias de plantas e incluir uma que devolve nitrogênio ao solo (feijão, crotalária), '
+         'para cuidar da terra e interromper pragas e doenças.</p>')
+
+    html('<h2 class="sec">O que sabemos sobre a sua terra</h2>')
+    cj, t, s, veg = clima_janela(d.get("clima"), mes, 4), d.get("terreno"), d.get("solo"), d.get("veg")
+    nasa = "NASA POWER, vale para a região"
+    html('<dl class="dados">' + "".join([
+        dado("Temperatura nos próximos meses", cj and f"{cj['t']:.0f} °C em média", nasa),
+        dado("Chuva esperada em 4 meses", cj and f"{cj['chuva']:.0f} mm", nasa),
+        dado("Umidade do ar", cj and cj["ur"] is not None and f"{cj['ur']:.0f}%", nasa),
+        dado("Altitude", t and f"{t['alt']:.0f} m", "NASA SRTM, 30 metros"),
+        dado("Terreno", t and ("Plano" if t["decl"] <= 3 else "Inclinado" if t["decl"] <= 6 else "Muito inclinado"), "NASA SRTM, 30 metros"),
+        dado("Umidade do solo", s and ("Bem mais seca que o normal" if s["pct"] < 0.25 else "Um pouco mais seca que o normal"
+             if s["pct"] < 0.4 else "Normal" if s["pct"] <= 0.6 else "Mais úmida que o normal")
+             + f" ({MES[s['mes'] - 1]} de {s['ano']})", "NASA FLDAS, ~11 km, vale para a região"),
+        dado("Meses com pouca planta no último ano", veg is not None and f"{int((veg < 0.3).sum())} de 12", "NASA MODIS, 250 metros")]) + "</dl>")
+    conf = confianca(d)
+    html(f'<p class="nota"><b>Confiança da sugestão: {conf}.</b> ' + {"alta": "Conseguimos todos os dados.",
+         "média": "Faltou algum dado; veja os itens marcados como sem dado.",
+         "baixa": "Faltaram dados importantes, como o clima. Use só como ideia inicial."}[conf] +
+         "<br><b>O que não sabemos:</b> o tipo e a fertilidade do solo, o preço de venda, o que já foi plantado aí e a sua estrutura "
+         "(máquinas, mão de obra). Clima e umidade do solo valem para a região, não só para a sua terra. "
+         "Converse com um agrônomo ou com a Emater-DF antes de decidir.</p>")
+
 with right, st.container(border=True):
     html('<div class="passo"><b>1</b><span>Marque a sua terra</span></div>')
     escolha("Como prefere marcar?", [M_CLICK, M_DESENHO], "modo", on_change=limpar)
@@ -688,60 +754,9 @@ with right, st.container(border=True):
         carregar_camadas(); st.stop()
     html(f'<p class="mut">Terra marcada: cerca de {ha:,.0f} hectares.</p>'.replace(",", "."))
 
-    html('<div class="passo"><b>2</b><span>Conte um pouco sobre você</span></div>')
-    nivel = escolha("Você já plantou antes?", list(NIVEIS), "nivel")
-    irriga = escolha("Tem água para irrigar?", list(AGUA), "agua")
-    obj = escolha("O que você quer?", list(OBJ), "obj")
-    mes = st.selectbox("Quando pretende plantar?", list(range(1, 13)), index=TODAY.month - 1, key="mes",
-                       format_func=lambda m: MES[m - 1].capitalize() + (" (este mês)" if m == TODAY.month else ""))
-    ult_nome = st.selectbox("O que plantou por último nesta terra?", [NUNCA, PARADA] + [c["nome"] for c in CAT], key="ult")
-
-with st.spinner("Consultando os satélites… pode levar um minuto."):
-    d = coletar(gj, REFERENCIA, ler_clima_df())
-perfil = dict(nivel=NIVEIS[nivel], irriga=AGUA[irriga], obj=OBJ[obj], ha=ha)
-ultimo = POR_NOME.get(ult_nome)
-ok, motivos = ranking(d, perfil, mes, ultimo)
-
-html(f'<h2 class="sec">O que combina com a sua terra em {MES[mes - 1]}</h2>')
-if not ok:
-    html('<p class="nota">Nada combina bem com a sua terra nesta época. ' + (
-        "Sem irrigação a chuva não é suficiente e várias culturas dessa época precisam de água. Tente outro mês ou veja se dá para irrigar."
-        if not perfil["irriga"] else "Tente outro mês.") + "</p>")
-else:
-    html(destaque(ok[0], mes))
-    if len(ok) > 1:
-        html("<div>" + "".join(linha(r) for r in ok[1:4]) + "</div>")
-    if len(ok) > 4:
-        html('<p class="mut">Também possível: ' + esc(", ".join(r["nome"] for r in ok[4:7])) + ".</p>")
-
-html('<h2 class="sec">E depois? Um plano de rotação</h2>')
-seq = plano(d, perfil, mes, ultimo)
-html('<ol class="trilha">' + "".join(
-    f'<li><time>{MES[mm - 1]}</time><b>{esc(r["nome"])}</b><span>{esc(r["bom"][0] if r["bom"] else r["desc"])}</span>'
-    + (f"<em>A terra descansa {e} mês(es) antes.</em>" if e else "") + "</li>" for mm, r, e in seq) + "</ol>")
-html('<p class="mut">A ideia é alternar famílias de plantas e incluir uma que devolve nitrogênio ao solo (feijão, crotalária), '
-     'para cuidar da terra e interromper pragas e doenças.</p>')
-
-html('<h2 class="sec">O que sabemos sobre a sua terra</h2>')
-cj, t, s, veg = clima_janela(d.get("clima"), mes, 4), d.get("terreno"), d.get("solo"), d.get("veg")
-nasa = "NASA POWER, vale para a região"
-html('<dl class="dados">' + "".join([
-    dado("Temperatura nos próximos meses", cj and f"{cj['t']:.0f} °C em média", nasa),
-    dado("Chuva esperada em 4 meses", cj and f"{cj['chuva']:.0f} mm", nasa),
-    dado("Umidade do ar", cj and cj["ur"] is not None and f"{cj['ur']:.0f}%", nasa),
-    dado("Altitude", t and f"{t['alt']:.0f} m", "NASA SRTM, 30 metros"),
-    dado("Terreno", t and ("Plano" if t["decl"] <= 3 else "Inclinado" if t["decl"] <= 6 else "Muito inclinado"), "NASA SRTM, 30 metros"),
-    dado("Umidade do solo", s and ("Bem mais seca que o normal" if s["pct"] < 0.25 else "Um pouco mais seca que o normal"
-         if s["pct"] < 0.4 else "Normal" if s["pct"] <= 0.6 else "Mais úmida que o normal")
-         + f" ({MES[s['mes'] - 1]} de {s['ano']})", "NASA FLDAS, ~11 km, vale para a região"),
-    dado("Meses com pouca planta no último ano", veg is not None and f"{int((veg < 0.3).sum())} de 12", "NASA MODIS, 250 metros")]) + "</dl>")
-conf = confianca(d)
-html(f'<p class="nota"><b>Confiança da sugestão: {conf}.</b> ' + {"alta": "Conseguimos todos os dados.",
-     "média": "Faltou algum dado; veja os itens marcados como sem dado.",
-     "baixa": "Faltaram dados importantes, como o clima. Use só como ideia inicial."}[conf] +
-     "<br><b>O que não sabemos:</b> o tipo e a fertilidade do solo, o preço de venda, o que já foi plantado aí e a sua estrutura "
-     "(máquinas, mão de obra). Clima e umidade do solo valem para a região, não só para a sua terra. "
-     "Converse com um agrônomo ou com a Emater-DF antes de decidir.</p>")
+    dados = {}
+    st.fragment(passo2)(gj, ha, resultados, dados)
+d = dados["d"]
 
 carregar_camadas()  # antes do radar, para o mapa ganhar as camadas o quanto antes
 radar, erros = None, dict(d.get("erros", {}))
