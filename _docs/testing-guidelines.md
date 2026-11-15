@@ -47,6 +47,11 @@ rodam ele inteiro com `streamlit.testing.v1.AppTest` (fixture `app` em `tests/co
   só em memória; a fixture `cache_disco` (usada por `app`) troca pelo cache em disco do `streamlit run`, numa pasta
   temporária do teste (nunca o `~/.streamlit/cache` de verdade). `app.reiniciar()` simula reiniciar o servidor: apaga
   o cache em memória e a sessão, e o disco fica (`tests/test_cache_disco.py`).
+- **Camadas e fragmento do mapa** (#15): as camadas do modo técnico vão ao `st_folium` em `feature_group_to_add`, não
+  como filhas do mapa; `camadas_tecnicas(grupos)` (conftest) devolve `{nome: (show, tiles)}`. O mapa fica num
+  `st.fragment(run_every=...)`; `app.rodar_sozinho()` simula o navegador rodando só o fragmento numa aba parada.
+  Para ver o que chegaria ao navegador (o `key` do componente, o `feature_group`), troque só
+  `streamlit_folium._component_func` por um mock (`tests/test_aba_parada.py`).
 
 ## O que não dá para testar aqui
 
