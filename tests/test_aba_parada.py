@@ -8,6 +8,7 @@ Aqui o `st_folium` é o de verdade; só o componente (`_component_func`) é fals
 O `key` é a identidade do componente: igual = o mesmo iframe, que não roda o `script` de novo (mantém zoom e
 posição) e só troca os grupos de `feature_group`.
 """
+import json
 import re
 from unittest import mock
 
@@ -143,6 +144,27 @@ def test_camadas_comecam_com_so_a_vegetacao_visivel(pagina):
     assert '"Radar (bruto, com ru\\u00eddo)": false' in inicio
     assert '"Radar (filtrado)": false' in inicio
     assert '"Sa\\u00fade da vegeta\\u00e7\\u00e3o (verde = saud\\u00e1vel)": true' in inicio
+
+
+def test_vegetacao_ausente_no_primeiro_carregamento_mantem_padrao_ao_recuperar(pagina, relogio):
+    app = pagina
+    app.ee.mapa_erro = lambda lin: RuntimeError("HLS indisponível") if any("HLS" in fonte for fonte in lin) else None
+    app.run().tecnico(True)
+    app.marcar_terra()
+    antes = ultimo(app.componente)
+    assert len(urls(antes)) == 2 and len(app.ee.mapas) == 3
+    inicio = json.loads(re.search(r"_rotadf_visiveis = (\{.*?\})", antes["feature_group"]).group(1))
+    assert inicio == {CAMADAS[0]: True, CAMADAS[1]: False, CAMADAS[2]: False}
+
+    app.ee.mapa_erro = None
+    relogio[0] += 3601
+    app.rodar_sozinho()
+    depois = ultimo(app.componente)
+    assert len(urls(depois)) == 3 and len(app.ee.mapas) == 6
+    assert depois["key"] == antes["key"]
+    assert depois["zoom"] is None and depois["center"] is None
+    recuperado = json.loads(re.search(r"_rotadf_visiveis = (\{.*?\})", depois["feature_group"]).group(1))
+    assert recuperado == inicio  # o estado inicial já reservava a vegetação; não a tratava como desligada
 
 
 def test_mudar_o_modo_tecnico_nao_recarrega_o_mapa(pagina):

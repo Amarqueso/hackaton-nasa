@@ -492,7 +492,8 @@ class _Visiveis(MacroElement):
     {% endmacro %}""")
     def __init__(self, grupos):
         super().__init__()
-        self.grupos, self.inicio = grupos, {g.layer_name: g.show for g in grupos}
+        # Inclui camadas ainda indisponíveis, para a recuperação manter seu padrão sem sobrescrever escolhas.
+        self.grupos, self.inicio = grupos, {nome: nome == CAMADAS[0] for nome in CAMADAS}
 
 def grupos_camadas(urls):
     """Camadas do modo técnico, uma por FeatureGroup, para o `feature_group_to_add` do st_folium (#15): o mapa já
