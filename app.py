@@ -123,15 +123,16 @@ class _NaoEstaNoCache(Exception):
 
 def _so_cache(): raise _NaoEstaNoCache
 
-def ler_clima_df():
+def ler_clima_df(hoje=None):
     """Lê e valida a cada execução, sem esconder mudanças, ausência ou corrupção no cache."""
+    hoje = hoje or dt.date.today()
     try:
         with open(os.path.join(os.path.dirname(__file__), "data", "clima_power_df.json"), encoding="utf-8") as arquivo:
             dados = json.load(arquivo)
         periodo = dados["periodo"]
         if (type(dados["versao"]) is not int or dados["versao"] != 1 or dados["fonte"] != "NASA POWER"
                 or type(periodo["inicio"]) is not int or periodo["inicio"] != 2015
-                or type(periodo["fim"]) is not int or not 2015 <= periodo["fim"] < TODAY.year
+                or type(periodo["fim"]) is not int or not 2015 <= periodo["fim"] < hoje.year
                 or dados["grade"] != {"origem_lat": GRADE_POWER[0][0], "passo_lat": GRADE_POWER[0][1],
                                      "origem_lon": GRADE_POWER[1][0], "passo_lon": GRADE_POWER[1][1]}
                 or not isinstance(dados["celulas"], dict) or not dados["celulas"]):
@@ -671,24 +672,29 @@ def carregar_camadas():
 
 resultados = st.empty()  # abaixo do mapa e da coluna da direita; o fragmento do passo 2 escreve aqui (#6)
 
-def passo2(gj, ha, area, dados):
+def passo2(gj, ha, area, tecnico, vez):
     """Passo 2 e resultados (#6). É um fragmento: mudar uma resposta roda só ele, e o mapa (outro fragmento) não é
     reconstruído nem mandado de novo ao navegador. Os widgets ficam dentro do fragmento (coluna da direita); os
     resultados não têm widgets e vão para `area`, um `st.empty` criado fora, que cada volta substitui (não acumula).
-    O que muda a terra fica fora, no passo 1 e no mapa, e roda a página inteira. `dados` é criado a cada execução
-    completa: ela guarda ali o `coletar` (com o aviso de consulta), e as voltas só do fragmento reaproveitam o mesmo."""
+    O que muda a terra fica fora, no passo 1 e no mapa, e roda a página inteira. A cada execução, data e JSON são
+    relidos e `coletar` usa o cache por fonte, permitindo retentativas e viradas sem congelar o agregado.
+    Só a primeira execução (completa) pode carregar as camadas adiadas; reruns do formulário não reenviam o mapa."""
+    completa = next(vez, False)
+    hoje = dt.date.today()
+    referencia = hoje.replace(day=1).isoformat()
     html('<div class="passo"><b>2</b><span>Conte um pouco sobre você</span></div>')
     nivel = escolha("Você já plantou antes?", list(NIVEIS), "nivel")
     irriga = escolha("Tem água para irrigar?", list(AGUA), "agua")
     obj = escolha("O que você quer?", list(OBJ), "obj")
-    mes = st.selectbox("Quando pretende plantar?", list(range(1, 13)), index=TODAY.month - 1, key="mes",
-                       format_func=lambda m: MES[m - 1].capitalize() + (" (este mês)" if m == TODAY.month else ""))
+    mes = st.selectbox("Quando pretende plantar?", list(range(1, 13)), index=hoje.month - 1, key="mes",
+                       format_func=lambda m: MES[m - 1].capitalize() + (" (este mês)" if m == hoje.month else ""))
     ult_nome = st.selectbox("O que plantou por último nesta terra?", [NUNCA, PARADA] + [c["nome"] for c in CAT], key="ult")
     with area.container():
-        if "d" not in dados:
-            with st.spinner("Consultando os satélites… pode levar um minuto."):
-                dados["d"] = coletar(gj, REFERENCIA, ler_clima_df())
-        resultado(dados["d"], dict(nivel=NIVEIS[nivel], irriga=AGUA[irriga], obj=OBJ[obj], ha=ha), mes, POR_NOME.get(ult_nome))
+        with st.spinner("Consultando os satélites… pode levar um minuto."):
+            d = coletar(gj, referencia, ler_clima_df(hoje))
+        resultado(d, dict(nivel=NIVEIS[nivel], irriga=AGUA[irriga], obj=OBJ[obj], ha=ha), mes, POR_NOME.get(ult_nome))
+        if completa: carregar_camadas()  # mantém o mapa antes do radar no primeiro carregamento (#7)
+        parecer(d, gj, referencia, tecnico)
 
 def resultado(d, perfil, mes, ultimo):
     """Recomendação, plano de rotação e o que sabemos sobre a terra (só elementos sem interação)."""
@@ -735,6 +741,40 @@ def resultado(d, perfil, mes, ultimo):
          "(máquinas, mão de obra). Clima e umidade do solo valem para a região, não só para a sua terra. "
          "Converse com um agrônomo ou com a Emater-DF antes de decidir.</p>")
 
+def parecer(d, gj, referencia, tecnico):
+    """Parecer e séries são redesenhados junto aos resultados, sem manter erros ou períodos antigos."""
+    radar, erros = None, dict(d.get("erros", {}))
+    if tecnico and EE_OK:  # o radar não entra na recomendação: só é consultado no modo técnico
+        with st.spinner("Carregando o radar…"):
+            dados_radar, falhas_radar = tentar({"radar": (radar_vh, (gj, referencia))})
+            radar = dados_radar["radar"]
+            erros.update(falhas_radar)
+
+    with st.expander("Parecer técnico (para quem entende do assunto)"):
+        periodo = d["clima_periodo"]
+        fontes = [("Clima (T2M, chuva, UR)", d.get("clima"), f"NASA POWER, média mensal {periodo['inicio']}–{periodo['fim']}, ~50 km"),
+                  ("Altitude e declive", d.get("terreno"), "NASA SRTM, 30 m"),
+                  ("Umidade do solo 0–10 cm", d.get("solo"), "NASA FLDAS Noah, mensal, 0,1° (~11 km); "
+                   "percentil do último mês vs. o mesmo mês de 2010 até o ano anterior"),
+                  ("NDVI mensal", d.get("veg"), "NASA MODIS MOD13Q1, 250 m (últimos 12 meses)"),
+                  ("Radar VH com filtro Lee", radar, "Sentinel-1 GRD (ESA), 30 m, Lee 5×5, ENL 4,4")]
+        disp = lambda n, v: "só no modo técnico" if n.startswith("Radar") and not tecnico else "sim" if v is not None else "NÃO"
+        st.dataframe(pd.DataFrame([{"Dado": n, "Disponível": disp(n, v), "Fonte / resolução": f} for n, v, f in fontes]),
+                     hide_index=True, width="stretch")
+        for k, e in erros.items(): st.caption(f"Falha em '{k}': {e}")
+        if d.get("clima"):
+            st.markdown("**Clima mensal (média do período)**")
+            st.dataframe(pd.DataFrame([{"Mês": MES[m - 1], "T média (°C)": v["t"], "Chuva (mm)": v["chuva"], "UR (%)": v["ur"]}
+                                       for m, v in d["clima"].items()]).round(1), hide_index=True, width="stretch")
+        if d.get("veg") is not None: st.markdown("**NDVI mensal (MODIS)**"); st.line_chart(d["veg"])
+        if radar is not None: st.markdown("**Radar VH filtrado (dB)**"); st.line_chart(radar)
+        st.markdown("**Método.** Ranking por regras (não é modelo treinado): janela de plantio, temperatura média e chuva do ciclo "
+                    "(até 4 meses) contra a faixa da cultura; exigência de irrigação; dificuldade vs. experiência; área mínima; objetivo; "
+                    "rotação (mesma família penaliza; leguminosa após não leguminosa e gramínea após leguminosa bonificam); declive > 6° favorece "
+                    "culturas de cobertura; umidade do solo abaixo do percentil 30 (sem irrigação). NDVI e filtro Lee seguem os notebooks "
+                    "NDVI/GEE_multiplas_datas e Lee_filter do curso. As faixas e janelas das culturas são referência agronômica geral e "
+                    "precisam de validação (Emater-DF, Embrapa Hortaliças/Cerrados). Clima e solo têm resolução (10–50 km) maior que a terra.")
+
 with right, st.container(border=True):
     html('<div class="passo"><b>1</b><span>Marque a sua terra</span></div>')
     escolha("Como prefere marcar?", [M_CLICK, M_DESENHO], "modo", on_change=limpar)
@@ -754,39 +794,4 @@ with right, st.container(border=True):
         carregar_camadas(); st.stop()
     html(f'<p class="mut">Terra marcada: cerca de {ha:,.0f} hectares.</p>'.replace(",", "."))
 
-    dados = {}
-    st.fragment(passo2)(gj, ha, resultados, dados)
-d = dados["d"]
-
-carregar_camadas()  # antes do radar, para o mapa ganhar as camadas o quanto antes
-radar, erros = None, dict(d.get("erros", {}))
-if tecnico and EE_OK:  # o radar não entra na recomendação: só é consultado no modo técnico
-    with st.spinner("Carregando o radar…"):
-        dados_radar, falhas_radar = tentar({"radar": (radar_vh, (gj, REFERENCIA))})
-        radar = dados_radar["radar"]
-        erros.update(falhas_radar)
-
-with st.expander("Parecer técnico (para quem entende do assunto)"):
-    periodo = d["clima_periodo"]
-    fontes = [("Clima (T2M, chuva, UR)", d.get("clima"), f"NASA POWER, média mensal {periodo['inicio']}–{periodo['fim']}, ~50 km"),
-              ("Altitude e declive", d.get("terreno"), "NASA SRTM, 30 m"),
-              ("Umidade do solo 0–10 cm", d.get("solo"), "NASA FLDAS Noah, mensal, 0,1° (~11 km); "
-               "percentil do último mês vs. o mesmo mês de 2010 até o ano anterior"),
-              ("NDVI mensal", d.get("veg"), "NASA MODIS MOD13Q1, 250 m (últimos 12 meses)"),
-              ("Radar VH com filtro Lee", radar, "Sentinel-1 GRD (ESA), 30 m, Lee 5×5, ENL 4,4")]
-    disp = lambda n, v: "só no modo técnico" if n.startswith("Radar") and not tecnico else "sim" if v is not None else "NÃO"
-    st.dataframe(pd.DataFrame([{"Dado": n, "Disponível": disp(n, v), "Fonte / resolução": f} for n, v, f in fontes]),
-                 hide_index=True, width="stretch")
-    for k, e in erros.items(): st.caption(f"Falha em '{k}': {e}")
-    if d.get("clima"):
-        st.markdown("**Clima mensal (média do período)**")
-        st.dataframe(pd.DataFrame([{"Mês": MES[m - 1], "T média (°C)": v["t"], "Chuva (mm)": v["chuva"], "UR (%)": v["ur"]}
-                                   for m, v in d["clima"].items()]).round(1), hide_index=True, width="stretch")
-    if d.get("veg") is not None: st.markdown("**NDVI mensal (MODIS)**"); st.line_chart(d["veg"])
-    if radar is not None: st.markdown("**Radar VH filtrado (dB)**"); st.line_chart(radar)
-    st.markdown("**Método.** Ranking por regras (não é modelo treinado): janela de plantio, temperatura média e chuva do ciclo "
-                "(até 4 meses) contra a faixa da cultura; exigência de irrigação; dificuldade vs. experiência; área mínima; objetivo; "
-                "rotação (mesma família penaliza; leguminosa após não leguminosa e gramínea após leguminosa bonificam); declive > 6° favorece "
-                "culturas de cobertura; umidade do solo abaixo do percentil 30 (sem irrigação). NDVI e filtro Lee seguem os notebooks "
-                "NDVI/GEE_multiplas_datas e Lee_filter do curso. As faixas e janelas das culturas são referência agronômica geral e "
-                "precisam de validação (Emater-DF, Embrapa Hortaliças/Cerrados). Clima e solo têm resolução (10–50 km) maior que a terra.")
+    st.fragment(passo2)(gj, ha, resultados, tecnico, iter([True]))
