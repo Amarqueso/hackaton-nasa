@@ -10,6 +10,7 @@ from time import monotonic, time
 import ee, folium, pandas as pd, requests, streamlit as st
 from folium.plugins import Draw
 from streamlit_folium import st_folium
+import aptidao, enso, zarc  # cobertura do solo, El Niño/La Niña (NOAA) e calendário oficial ZARC de Brasília
 
 st.set_page_config(page_title="RotaDF", layout="wide", initial_sidebar_state="collapsed")
 
@@ -179,6 +180,8 @@ OBJ = {"Renda": "renda", "Alimentação": "comida", "Cuidar da terra": "terra"}
 TAM = {"Pequena (cerca de 2 hectares)": 2, "Média (cerca de 10 hectares)": 10,
        "Grande (cerca de 50 hectares)": 50, "Muito grande (cerca de 200 hectares)": 200}
 NUNCA, PARADA = "Nunca plantei / não sei", "Terra parada (nada)"
+SOLO_PADRAO = next(iter(zarc.SOLOS))  # "Não sei (usar solo médio)"
+DF_LIMITES = (-16.05, -15.50, -48.29, -47.31)  # o ZARC usado é o do município de Brasília, que cobre o DF inteiro
 
 # ---------------- Geografia ----------------
 def pontos(gj): return json.loads(gj)["coordinates"][0]
@@ -312,6 +315,19 @@ def ndvi(gj, referencia, _calc=None):
     return _ou_none(month_series(lambda s, e: ee.ImageCollection("MODIS/061/MOD13Q1")
                     .filterDate(s, e).select("NDVI").mean(), "NDVI", geom, 250, inicio) * 1e-4)
 
+@st.cache_data(show_spinner=False, ttl=6 * 3600)
+def enso_oni(referencia, _calc=None):
+    """Fase do El Niño / La Niña pelo índice ONI da NOAA (vale para o planeta todo, não depende da terra).
+    `referencia` só renova a chave na virada do mês; o ttl de 6 h pega a atualização mensal da NOAA."""
+    if _calc: return _calc()
+    return enso.classificar(enso.baixar_oni())
+
+@st.cache_data(show_spinner=False)
+def cobertura(gj, referencia, _calc=None):
+    """O que existe na terra (Dynamic World, JRC Global Surface Water, WDPA), para dizer se dá para plantar."""
+    if _calc: return _calc()
+    return aptidao.calcular(ee.Geometry(json.loads(gj)), referencia)
+
 def tentar(fontes):
     """Sucessos (inclusive None) ficam no cache de cada fonte. Falhas ficam só nesta sessão por 120s desde a
     conclusão, por fonte e argumentos (célula para clima/solo). Apenas misses sem pausa rodam em paralelo.
@@ -359,6 +375,7 @@ def coletar(gj, referencia, clima_arquivo):
     periodo = clima_arquivo["periodo"] if local else {"inicio": 2015, "fim": ref.year - 1}
     # Sem cache agregado, o arquivo validado mais recente é usado mesmo após erros ou cache antigo da API.
     fontes = {} if local else {"clima": (clima_power, (*grade_clima, ref.year - 1))}
+    fontes["enso"] = (enso_oni, (referencia,))  # NOAA, não depende do Earth Engine
     d, erros = {}, {}
     if fontes and estado_ee(esperar=False)[0] is None:  # ainda conectando: o clima não espera pelo Earth Engine (#20)
         d, erros = tentar(fontes)
@@ -368,10 +385,11 @@ def coletar(gj, referencia, clima_arquivo):
         fontes["terreno"] = (terreno, (gj,))
         fontes["solo"] = (umidade_solo, (*celula(lat, lon, GRADE_FLDAS), referencia))
         fontes["veg"] = (ndvi, (gj, referencia))
+        fontes["cobertura"] = (cobertura, (gj, referencia))
     d2, erros2 = tentar(fontes)
     d.update(d2); erros.update(erros2)
     if local: d["clima"] = local
-    d = {k: d[k] for k in ("clima", "terreno", "solo", "veg") if k in d}  # mesma ordem de antes
+    d = {k: d[k] for k in ("clima", "terreno", "solo", "veg", "enso", "cobertura") if k in d}  # mesma ordem de antes
     if not ee_ok:
         erros["gee"] = ee_erro
     d["erros"] = erros
@@ -442,6 +460,23 @@ def avaliar(c, d, p, mes, ultimo):
     if s and not p["irriga"] and s["pct"] < 0.3:
         if c["agua"] == "baixa": pts += 8; bom.append("Aguenta bem o solo mais seco que o normal na região.")
         elif c["agua"] == "alta": pts -= 8; cuid.append("O solo da região está mais seco que o normal.")
+    en = d.get("enso")
+    if en and en["fase"] == "El Niño" and en["intensidade"] in ("moderado", "forte", "muito forte") and not p["irriga"]:
+        if c["agua"] == "alta":
+            pts -= 10; cuid.append(f"Ano de {enso.rotulo(en)}: no DF a chuva tende a ser irregular, com veranicos.")
+        elif c["agua"] == "baixa":
+            pts += 5; bom.append(f"Aguenta a chuva irregular de um ano de {enso.rotulo(en)}.")
+    z = zarc.risco_mes(c["nome"], p.get("solo", SOLO_PADRAO), mes, p["irriga"])
+    if z:  # ZARC só restringe: fora do calendário ou acima do risco aceito no ano tira pontos; dentro, só explica
+        (r, dec), tol = z, zarc.tolerancia(en)
+        if r == 0:
+            pts -= 30; cuid.append(f"Fora do calendário oficial (ZARC) de Brasília em {MES[mes - 1]}: "
+                                   "mais risco de perda e sem seguro rural/Proagro.")
+        elif r > tol:
+            pts -= 10; cuid.append(f"No ZARC, plantar em {MES[mes - 1]} tem risco de {r}% de perda "
+                                   f"(neste ano aceitamos até {tol}%).")
+        else:
+            bom.append(f"Está no calendário oficial (ZARC): risco de {r}% plantando em {zarc.nome_dec(dec)}.")
     # O teto serve à barra visual; ordenar por ele apagaria diferenças ambientais acima de 100.
     return dict(c, adequacao=pts, pts=max(0, min(100, round(pts))), bom=bom, cuid=cuid)
 
@@ -674,6 +709,12 @@ h2.sec{font-size:1.6rem;margin:2.4rem 0 .9rem;font-weight:700}
 .dados .falta{color:var(--terra);font-weight:600}
 .nota{border-left:3px solid var(--ipe);padding:.3rem 1rem;margin:1rem 0;line-height:1.55}
 .mut{color:var(--mut);font-size:.92rem}
+.apt{border-radius:12px;padding:1rem 1.3rem;margin:.4rem 0 .6rem;border:1px solid var(--linha);background:var(--papel)}
+.apt h4{margin:0 0 .3rem;font-size:1.15rem}
+.apt ul{margin:.3rem 0 0;padding-left:1.1rem}.apt li{margin:.25rem 0;font-size:.93rem}
+.apt.ok{background:var(--verde-cl);border-color:var(--verde-cl)}
+.apt.alerta{background:#FFF4D6;border-color:#F1DC9C}
+.apt.ruim{background:#F8E3DB;border-color:#E9C2B3}.apt.ruim h4{color:var(--terra)}
 @media (max-width:720px){.block-container{padding:.8rem .9rem 3rem}.linha{grid-template-columns:1fr;gap:.4rem}
 .dados>div{grid-template-columns:1fr}.destaque{padding:1.2rem}.destaque h3{font-size:1.45rem}h2.sec{font-size:1.35rem}}
 """
@@ -794,17 +835,65 @@ def passo2(gj, ha, area, tecnico, vez):
     mes = st.selectbox("Quando pretende plantar?", list(range(1, 13)), index=hoje.month - 1, key="mes",
                        format_func=lambda m: MES[m - 1].capitalize() + (" (este mês)" if m == hoje.month else ""))
     ult_nome = st.selectbox("O que plantou por último nesta terra?", [NUNCA, PARADA] + [c["nome"] for c in CAT], key="ult")
+    solo = st.selectbox("Como é o solo da sua terra?", list(zarc.SOLOS), key="solo",
+                        help="Usado no calendário oficial de plantio (ZARC). AD = água disponível no solo: "
+                             "AD1 segura pouca água, AD6 segura muita.")
     with area.container():
         with st.spinner("Consultando os satélites… pode levar um minuto."):
             d = coletar(gj, referencia, ler_clima_df(hoje))
-        resultado(d, dict(nivel=NIVEIS[nivel], irriga=AGUA[irriga], obj=OBJ[obj], ha=ha), mes, POR_NOME.get(ult_nome))
+    t = d.get("terreno")
+    # sem a cobertura (Earth Engine fora ou falha) não há veredito; a falha aparece no parecer técnico
+    apt = aptidao.avaliar(d["cobertura"], t and t["decl"], ha) if d.get("cobertura") is not None else None
+    mostrar = not (apt and apt["nivel"] == "inapta") or st.checkbox(
+        "Mostrar a sugestão mesmo assim (sei que a área é plantável)", key="forcar")
+    with area.container():  # substitui o spinner pelos resultados
+        resultado(d, dict(nivel=NIVEIS[nivel], irriga=AGUA[irriga], obj=OBJ[obj], ha=ha, solo=solo), mes,
+                  POR_NOME.get(ult_nome), apt, mostrar, gj)
         if completa: carregar_camadas()  # mantém o mapa antes do radar no primeiro carregamento (#7)
         parecer(d, gj, referencia, tecnico)
 
-def resultado(d, perfil, mes, ultimo):
-    """Recomendação, plano de rotação e o que sabemos sobre a terra (só elementos sem interação)."""
+def bloco_aptidao(apt, ha):
+    """Veredito do satélite sobre a área: dá para plantar? (Dynamic World, JRC, WDPA)."""
+    if apt is None: return
+    mil = lambda v: f"{v:,.0f}".replace(",", ".")
+    motivos = f"<ul>{lis(apt['motivos'], 'nd')}</ul>" if apt["motivos"] else ""
+    if apt["nivel"] == "inapta":
+        html(f'<div class="apt ruim"><h4>🔴 Esta área não parece própria para plantio</h4>{motivos}</div>')
+    elif apt["nivel"] == "restricao":
+        html(f'<div class="apt alerta"><h4>🟡 Dá para plantar, com cuidados</h4>Área plantável estimada: '
+             f'<b>{mil(apt["util_ha"])} ha</b> de {mil(ha)} ha.{motivos}</div>')
+    elif apt["nivel"] == "apta":
+        html(f'<div class="apt ok"><h4>🟢 Área apta para plantio</h4>O satélite viu lavoura, pasto ou campo em '
+             f'{apt["frac_util"]:.0%} da área, sem construções, água ou áreas protegidas relevantes.</div>')
+    else:
+        html(f'<div class="apt">{motivos}</div>')
+
+def dentro_df(gj):
+    lat, lon = centro_de(gj)
+    return DF_LIMITES[0] <= lat <= DF_LIMITES[1] and DF_LIMITES[2] <= lon <= DF_LIMITES[3]
+
+def resultado(d, perfil, mes, ultimo, apt=None, mostrar=True, gj=None):
+    """Aptidão da área, recomendação, plano de rotação e o que sabemos sobre a terra (só elementos sem interação).
+    Com a área inapta e `mostrar` falso, pula a recomendação e o plano."""
     ok, motivos = ranking(d, perfil, mes, ultimo)
 
+    if apt is not None:
+        html('<h2 class="sec">Dá para plantar nessa área?</h2>')
+        bloco_aptidao(apt, perfil["ha"])
+        html('<p class="mut">Fontes: Dynamic World (Sentinel-2, 10 m, últimos 6 meses), JRC Global Surface Water e WDPA. '
+             'O satélite pode confundir pasto seco com solo exposto ou pasto sujo com cerrado: confira no mapa.</p>')
+    if gj and not dentro_df(gj):
+        html('<p class="nota">Sua terra parece estar fora do DF. O calendário oficial (ZARC) usado é o de Brasília; '
+             'confira o do seu município.</p>')
+
+    if mostrar:
+        recomendacao_e_plano(d, perfil, mes, ultimo, ok)
+    else:
+        html('<p class="nota">Como a área não parece plantável, não mostramos sugestão de plantio. '
+             'Se você sabe que dá para plantar, marque a opção ao lado do formulário.</p>')
+    sobre_a_terra(d, mes)
+
+def recomendacao_e_plano(d, perfil, mes, ultimo, ok):
     html(f'<h2 class="sec">O que combina com a sua terra em {MES[mes - 1]}</h2>')
     if not ok:
         html('<p class="nota">Nada combina bem com a sua terra nesta época. ' + (
@@ -825,8 +914,10 @@ def resultado(d, perfil, mes, ultimo):
     html('<p class="mut">A ideia é alternar famílias de plantas e incluir uma que devolve nitrogênio ao solo (feijão, crotalária), '
          'para cuidar da terra e interromper pragas e doenças.</p>')
 
+def sobre_a_terra(d, mes):
     html('<h2 class="sec">O que sabemos sobre a sua terra</h2>')
     cj, t, s, veg = clima_janela(d.get("clima"), mes, 4), d.get("terreno"), d.get("solo"), d.get("veg")
+    en = d.get("enso")
     nasa = "NASA POWER, vale para a região"
     html('<dl class="dados">' + "".join([
         dado("Temperatura nos próximos meses", cj and f"{cj['t']:.0f} °C em média", nasa),
@@ -837,12 +928,18 @@ def resultado(d, perfil, mes, ultimo):
         dado("Umidade do solo", s and ("Bem mais seca que o normal" if s["pct"] < 0.25 else "Um pouco mais seca que o normal"
              if s["pct"] < 0.4 else "Normal" if s["pct"] <= 0.6 else "Mais úmida que o normal")
              + f" ({MES[s['mes'] - 1]} de {s['ano']})", "NASA FLDAS, ~11 km, vale para a região"),
-        dado("Meses com pouca planta no último ano", veg is not None and f"{int((veg < 0.3).sum())} de 12", "NASA MODIS, 250 metros")]) + "</dl>")
+        dado("Meses com pouca planta no último ano", veg is not None and f"{int((veg < 0.3).sum())} de 12", "NASA MODIS, 250 metros"),
+        dado("Pacífico (El Niño / La Niña)", en and f"{enso.rotulo(en)} (ONI {en['oni']:+.1f} °C, {en['trimestre']})",
+             "NOAA, índice ONI")]) + "</dl>")
+    if en:
+        tol = zarc.tolerancia(en)
+        html(f'<p class="nota"><b>Clima do ano:</b> {esc(en["impacto"])} Por isso, no calendário oficial (ZARC) de '
+             f'Brasília, aceitamos datas com risco de perda de até {tol}%.</p>')
     conf = confianca(d)
     html(f'<p class="nota"><b>Confiança da sugestão: {conf}.</b> ' + {"alta": "Conseguimos todos os dados.",
          "média": "Faltou algum dado; veja os itens marcados como sem dado.",
          "baixa": "Faltaram dados importantes, como o clima. Use só como ideia inicial."}[conf] +
-         "<br><b>O que não sabemos:</b> o tipo e a fertilidade do solo, o preço de venda, o que já foi plantado aí e a sua estrutura "
+         "<br><b>O que não sabemos:</b> a fertilidade do solo, o preço de venda, o que já foi plantado aí e a sua estrutura "
          "(máquinas, mão de obra). Clima e umidade do solo valem para a região, não só para a sua terra. "
          "Converse com um agrônomo ou com a Emater-DF antes de decidir.</p>")
 
@@ -862,7 +959,12 @@ def parecer(d, gj, referencia, tecnico):
                   ("Umidade do solo 0–10 cm", d.get("solo"), "NASA FLDAS Noah, mensal, 0,1° (~11 km); "
                    "percentil do último mês vs. o mesmo mês de 2010 até o ano anterior"),
                   ("NDVI mensal", d.get("veg"), "NASA MODIS MOD13Q1, 250 m (últimos 12 meses)"),
-                  ("Radar VH com filtro Lee", radar, "Sentinel-1 GRD (ESA), 30 m, Lee 5×5, ENL 4,4")]
+                  ("Radar VH com filtro Lee", radar, "Sentinel-1 GRD (ESA), 30 m, Lee 5×5, ENL 4,4"),
+                  ("Cobertura do solo", d.get("cobertura"), "Dynamic World V1 (Sentinel-2, 10 m, moda de 6 meses), "
+                   "JRC Global Surface Water 1.4 (30 m), WDPA (UCs IUCN Ia–III)"),
+                  ("El Niño / La Niña", d.get("enso"), "NOAA CPC, Oceanic Niño Index (Niño 3.4, trimestral)"),
+                  ("Calendário de plantio (ZARC)", zarc.base(), "MAPA, Tábua de Risco do ZARC, município de Brasília "
+                   "(data/zarc_brasilia.csv)")]
         disp = lambda n, v: "só no modo técnico" if n.startswith("Radar") and not tecnico else "sim" if v is not None else "NÃO"
         st.dataframe(pd.DataFrame([{"Dado": n, "Disponível": disp(n, v), "Fonte / resolução": f} for n, v, f in fontes]),
                      hide_index=True, width="stretch")
@@ -879,6 +981,13 @@ def parecer(d, gj, referencia, tecnico):
                     "culturas de cobertura; umidade do solo abaixo do percentil 30 (sem irrigação). NDVI e filtro Lee seguem os notebooks "
                     "NDVI/GEE_multiplas_datas e Lee_filter do curso. As faixas e janelas das culturas são referência agronômica geral e "
                     "precisam de validação (Emater-DF, Embrapa Hortaliças/Cerrados). Clima e solo têm resolução (10–50 km) maior que a terra.")
+        st.markdown("**ZARC, El Niño e aptidão.** Soja, milho, feijão e sorgo são conferidos na tábua de risco do ZARC de "
+                    "Brasília pelo tipo de solo (AD1–AD6) e pelo melhor decêndio do mês: fora do zoneamento tira 30 pontos e risco "
+                    "acima do aceito no ano tira 10. O ENSO vem do ONI da NOAA (±0,5 °C; confirmado após 5 trimestres seguidos); "
+                    "com El Niño moderado ou mais forte aceitamos só risco de 20% (senão 30%) e, sem irrigação, culturas de alta "
+                    "demanda de água perdem 10 pontos e as de baixa ganham 5. A aptidão usa a classe mais frequente do Dynamic "
+                    "World em 6 meses: ≥ 30% de construção, água ou brejo, área em UC de proteção integral ou quase só vegetação "
+                    "nativa tornam a área inapta; frações menores geram alertas. Limiares heurísticos, a validar.")
 
 with right, st.container(border=True):
     html('<div class="passo"><b>1</b><span>Marque a sua terra</span></div>')

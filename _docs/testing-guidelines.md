@@ -48,6 +48,13 @@ rodam ele inteiro com `streamlit.testing.v1.AppTest` (fixture `app` em `tests/co
   falsas esperam numa `threading.Barrier` (ver `tests/test_coletar.py`): se fosse uma de cada vez, a barreira estouraria.
 - **NASA POWER**: `requests.get` é trocado por um `mock` com um JSON mínimo (`resposta_power`); `app.get.call_count`
   conta as consultas.
+- **El Niño / La Niña (NOAA)**: `enso.baixar_oni` é trocado por um `mock` (`app.oni`) que devolve uma série neutra
+  (`ONI_NEUTRO`); `conftest.oni(*valores)` monta outras séries. Fica fora do `requests.get` falso para não somar às
+  consultas da POWER.
+- **Cobertura do solo** (aptidão): `fake_ee.respostas["DYNAMICWORLD"]` responde a consulta única de
+  `aptidao.calcular` (Dynamic World + JRC + WDPA); `fake_ee.cobertura({"construcao": 0.6, ...})` monta outras áreas.
+- **ZARC**: lê o `data/zarc_brasilia.csv` de verdade (não usa rede). Para forçar um cenário, troque `zarc.risco_mes`
+  por um `mock` (`tests/test_zarc_enso_aptidao.py`).
 - **Spinners**: `streamlit.spinner` é envolvido para registrar os textos em `app.spinners`. O spinner do Streamlit só
   aparece depois de 0,5 s, então uma chamada que vem do cache não mostra aviso; nos testes, "não consultou de novo"
   é verificado pelos contadores, não pelo spinner.

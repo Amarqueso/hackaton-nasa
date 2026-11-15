@@ -15,10 +15,24 @@ from streamlit.runtime.caching.storage import local_disk_cache_storage
 from streamlit.testing.v1 import AppTest, app_test, local_script_runner
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))  # enso.py, zarc.py, aptidao.py
 from fake_ee import FakeEE  # noqa: E402
 
 APP = str(pathlib.Path(__file__).resolve().parents[1] / "app.py")
 PONTO_DF = (-15.78, -47.80)  # um ponto qualquer no DF
+
+
+def oni(*valores, fim=("JAS", 2026)):
+    """Série do ONI (NOAA) como `enso.baixar_oni` devolve: [(trimestre, ano, anomalia)], terminando em `fim`."""
+    tri = ["DJF", "JFM", "FMA", "MAM", "AMJ", "MJJ", "JJA", "JAS", "ASO", "SON", "OND", "NDJ"]
+    i, ano, out = tri.index(fim[0]), fim[1], []
+    for v in reversed(valores):
+        out.append((tri[i], ano, v))
+        i, ano = (i - 1, ano) if i else (11, ano - 1)
+    return out[::-1]
+
+
+ONI_NEUTRO = oni(0.1, 0.0, -0.1, 0.2, 0.1, 0.0)
 
 
 def resposta_power():
@@ -170,8 +184,12 @@ def app(fake_ee, cache_disco, arquivo_clima):
         with real(texto, *a, **kw):
             yield
 
+    # O ONI da NOAA também é pego pela rede: fica fora do `requests.get` falso da POWER (que conta só a POWER).
     with mock.patch("requests.get", return_value=resposta_power()) as get, \
+            mock.patch("enso.baixar_oni", return_value=ONI_NEUTRO) as baixar_oni, \
             mock.patch("streamlit.spinner", spinner):
-        yield App(fake_ee, get, spinners)
+        a = App(fake_ee, get, spinners)
+        a.oni = baixar_oni
+        yield a
     st.cache_data.clear()
     st.cache_resource.clear()

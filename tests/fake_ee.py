@@ -36,6 +36,16 @@ def serie_mensal(valor, ate=(2026, 9), de=(2010, 1)):
 
 SEM_V = object()
 
+CLASSES_DW = ["agua", "arvores", "campo", "alagado", "lavoura", "arbustos", "construcao", "solo_exposto", "neve"]
+
+
+def cobertura(fracoes, agua_perm=0.0, agua_sazonal=0.0, uc_frac=0.0, uc_nomes=()):
+    """Resposta de `aptidao.calcular` (um ee.Dictionary): histograma do Dynamic World (10 000 pixels repartidos
+    conforme `fracoes`, por nome de classe), frações de água do JRC e da área em unidade de conservação (WDPA)."""
+    hist = {str(CLASSES_DW.index(k)): round(v * 10000) for k, v in fracoes.items()}
+    return {"hist": hist, "agua": {"perm": agua_perm, "sazonal": agua_sazonal},
+            "uc_frac": uc_frac, "uc_nomes": list(uc_nomes)}
+
 
 def _solo_padrao(a, m):
     """O último mês (2026-09) fica no meio dos anos anteriores: classe "Normal"."""
@@ -101,6 +111,7 @@ class FakeEE(types.ModuleType):
             "FLDAS": lambda: serie_mensal(_solo_padrao),
             "MOD13Q1": lambda: serie([5000.0] * 12),
             "S1_GRD": lambda: serie([-15.0 + 0.1 * i for i in range(12)]),
+            "DYNAMICWORLD": lambda: cobertura({"lavoura": 0.85, "campo": 0.13, "arvores": 0.02}),
         }
 
     def Initialize(self, *a, **kw):
