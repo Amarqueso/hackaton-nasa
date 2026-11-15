@@ -18,31 +18,58 @@ EE_PRAZO, EE_PAUSA = 30, 120  # s: desiste do Initialize; não tenta de novo dep
 @st.cache_resource(show_spinner=False)
 def _estado_ee():
     """Um por processo: o `cache_resource` não guarda exceções, então a falha fica aqui e não refaz o init a cada rerun."""
-    return {"ok": False, "erro": "", "falhou": None, "tentativa": None, "trava": threading.Lock()}
+    return {"ok": False, "erro": "", "falhou": None, "tentativa": None, "inicio": None, "registrada": None,
+            "desistiu": None, "trava": threading.RLock()}
 
-def init_ee():
-    """Inicializa o Earth Engine uma vez por processo. Falha vale EE_PAUSA s para todas as sessões; o Initialize roda
-    numa thread para desistir em EE_PRAZO s no total (o `setDeadline` não vale antes do Initialize e é por requisição,
-    multiplicado pelas retentativas). Uma tentativa ainda presa não é repetida."""
+def _registrar_ee(e, fut):
+    """Fim de uma tentativa, uma vez só. Roda na thread do Initialize (callback) ou na do script: nada de st.* aqui."""
+    with e["trava"]:
+        if e["registrada"] is fut or not fut.done(): return
+        e["registrada"] = fut
+        erro = fut.exception()
+        if erro is None: e.update(ok=True, erro="", falhou=None)
+        else: e.update(ok=False, erro=str(erro)[:300], falhou=monotonic())
+
+def _ee_pendente(e):
+    fut = e["tentativa"]
+    return fut is not None and not fut.done() and e["desistiu"] is not fut
+
+def iniciar_ee():
+    """Começa o Initialize em segundo plano, sem esperar (#20): a página desenha enquanto ele roda. Uma tentativa por
+    vez no processo; depois de uma falha, só tenta de novo após EE_PAUSA s (#19). Uma tentativa ainda presa não é
+    repetida."""
     e = _estado_ee()
     with e["trava"]:
-        pausa = e["falhou"] is not None and monotonic() - e["falhou"] < EE_PAUSA
-        presa = e["tentativa"] is not None and not e["tentativa"].done()
-        if e["ok"] or pausa or presa:
-            return e["ok"], e["erro"]
-        with st.spinner("Conectando ao Earth Engine…"):
-            ex = ThreadPoolExecutor(max_workers=1)
-            e["tentativa"] = ex.submit(ee.Initialize, project=os.environ.get("GEE_PROJECT"))
-            ex.shutdown(wait=False)
-            try:
-                e["tentativa"].result(timeout=EE_PRAZO)
-                e.update(ok=True, erro="", falhou=None)
-            except FuturesTimeout:
-                e.update(erro=f"Earth Engine não respondeu em {EE_PRAZO} s", falhou=monotonic())
-            except Exception as _e:
-                e.update(erro=str(_e)[:300], falhou=monotonic())
+        if e["ok"] or (e["falhou"] is not None and monotonic() - e["falhou"] < EE_PAUSA): return
+        if e["tentativa"] is not None and not e["tentativa"].done(): return
+        ex = ThreadPoolExecutor(max_workers=1)
+        fut = ex.submit(ee.Initialize, project=os.environ.get("GEE_PROJECT"))
+        ex.shutdown(wait=False)
+        e.update(tentativa=fut, inicio=monotonic())
+        fut.add_done_callback(lambda f: _registrar_ee(e, f))  # RLock: se já terminou, roda aqui mesmo
+
+def estado_ee(esperar=True):
+    """(ok, erro) do Earth Engine, chamado só onde um dado dele é necessário. Com a tentativa em andamento, espera por
+    ela até EE_PRAZO s desde o início (o `setDeadline` não vale antes do Initialize e é por requisição, multiplicado
+    pelas retentativas); com `esperar=False` devolve (None, "") nesse caso."""
+    iniciar_ee()  # reruns só de fragmento também tentam de novo depois da pausa
+    e = _estado_ee()
+    fut = e["tentativa"]
+    if _ee_pendente(e):
+        if not esperar: return None, ""
+        try:
+            with st.spinner("Conectando ao Earth Engine…"):
+                fut.result(timeout=max(0, EE_PRAZO - (monotonic() - e["inicio"])))
+        except FuturesTimeout:
+            with e["trava"]:
+                if not fut.done():
+                    e.update(desistiu=fut, ok=False, erro=f"Earth Engine não respondeu em {EE_PRAZO} s", falhou=monotonic())
+        except Exception:
+            pass  # o erro é registrado abaixo
+    if fut is not None: _registrar_ee(e, fut)  # o callback pode ainda não ter rodado quando `result` volta
     return e["ok"], e["erro"]
-EE_OK, EE_ERRO = init_ee()
+
+iniciar_ee()
 
 TODAY = dt.date.today()
 REFERENCIA = TODAY.replace(day=1).isoformat()  # cache mensal; janela de 12 meses termina no mês passado
@@ -287,15 +314,21 @@ def coletar(gj, referencia, clima_arquivo):
     periodo = clima_arquivo["periodo"] if local else {"inicio": 2015, "fim": ref.year - 1}
     # Sem cache agregado, o arquivo validado mais recente é usado mesmo após erros ou cache antigo da API.
     fontes = {} if local else {"clima": (clima_power, (*grade_clima, ref.year - 1))}
-    if EE_OK:
+    d, erros = {}, {}
+    if fontes and estado_ee(esperar=False)[0] is None:  # ainda conectando: o clima não espera pelo Earth Engine (#20)
+        d, erros = tentar(fontes)
+        fontes = {}
+    ee_ok, ee_erro = estado_ee()
+    if ee_ok:
         fontes["terreno"] = (terreno, (gj,))
         fontes["solo"] = (umidade_solo, (*celula(lat, lon, GRADE_FLDAS), referencia))
         fontes["veg"] = (ndvi, (gj, referencia))
-    d, erros = tentar(fontes)
+    d2, erros2 = tentar(fontes)
+    d.update(d2); erros.update(erros2)
     if local: d["clima"] = local
     d = {k: d[k] for k in ("clima", "terreno", "solo", "veg") if k in d}  # mesma ordem de antes
-    if not EE_OK:
-        erros["gee"] = EE_ERRO
+    if not ee_ok:
+        erros["gee"] = ee_erro
     d["erros"] = erros
     d["clima_periodo"] = periodo
     return d
@@ -657,7 +690,9 @@ def mapa(gj, tecnico, modo, vez):
     sozinho (`vez` já consumido) `layers` é chamado direto: se o cache expirou, renova ali mesmo, e o mapa aberto só
     troca as camadas. Na execução completa, camadas fora do cache ficam para o fim da página (#7)."""
     completa, cam, pendentes = next(vez, False), None, False
-    if gj and tecnico and EE_OK:
+    # na execução completa não espera o Earth Engine: o mapa sai antes e as camadas ficam para o fim da página (#20)
+    ee_ok = estado_ee(esperar=not completa)[0] if gj and tecnico else None
+    if gj and tecnico and ee_ok is not False:
         if completa:
             try: cam = layers(gj, REFERENCIA, TODAY.isoformat(), _calc=_so_cache)
             except _NaoEstaNoCache: pendentes = True
@@ -678,18 +713,19 @@ def mapa(gj, tecnico, modo, vez):
     aviso = st.empty()  # perto do mapa; some quando as camadas entram
     if pendentes: aviso.caption(CARREGANDO_CAMADAS)
     elif cam and cam["falhas"]: aviso.caption(aviso_camadas(cam["falhas"]))
-    elif gj and tecnico and not EE_OK: aviso.caption(aviso_camadas(CAMADAS))
+    elif ee_ok is False: aviso.caption(aviso_camadas(CAMADAS))
     return pendentes, aviso
 
 left, right = st.columns([1.7, 1], gap="large")
 with left:  # modo técnico desligado: sem run_every, a aba parada não roda nada (nem consulta o Earth Engine)
-    renovar = RENOVAR_CAMADAS if gj and tecnico and EE_OK else None
+    renovar = RENOVAR_CAMADAS if gj and tecnico and estado_ee(esperar=False)[0] is not False else None
     camadas_pendentes, aviso = st.fragment(mapa, run_every=renovar)(gj, tecnico, modo, iter([True]))
 
 def carregar_camadas():
     """Calcula as camadas que ficaram fora do cache (agora já no cache de `layers`, por gj) e redesenha o mapa com
     elas. Como a chave é a terra, um clique em outro ponto no meio do caminho não leva estas camadas para a terra nova."""
     if not camadas_pendentes: return
+    if not estado_ee()[0]: aviso.caption(aviso_camadas(CAMADAS)); return  # o mapa saiu antes do init terminar (#20)
     try: layers(gj, REFERENCIA, TODAY.isoformat())
     except Exception: aviso.caption(aviso_camadas(CAMADAS)); return  # não deveria acontecer: layers não levanta
     st.rerun()
@@ -768,7 +804,7 @@ def resultado(d, perfil, mes, ultimo):
 def parecer(d, gj, referencia, tecnico):
     """Parecer e séries são redesenhados junto aos resultados, sem manter erros ou períodos antigos."""
     radar, erros = None, dict(d.get("erros", {}))
-    if tecnico and EE_OK:  # o radar não entra na recomendação: só é consultado no modo técnico
+    if tecnico and estado_ee()[0]:  # o radar não entra na recomendação: só é consultado no modo técnico
         with st.spinner("Carregando o radar…"):
             dados_radar, falhas_radar = tentar({"radar": (radar_vh, (gj, referencia))})
             radar = dados_radar["radar"]
