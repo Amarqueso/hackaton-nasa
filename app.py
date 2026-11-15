@@ -5,6 +5,8 @@ Rodar: earthengine authenticate ; streamlit run app.py   (.env: GEE_PROJECT=seu-
 from dotenv import load_dotenv
 load_dotenv()
 import os, json, math, datetime as dt
+from concurrent.futures import ThreadPoolExecutor
+from time import monotonic
 import ee, folium, pandas as pd, requests, streamlit as st
 from folium.plugins import Draw
 from streamlit_folium import st_folium
@@ -20,7 +22,7 @@ except Exception as _e:
     EE_OK, EE_ERRO = False, str(_e)[:300]
 
 TODAY = dt.date.today()
-START = dt.date(TODAY.year - 1, TODAY.month, 1)  # janela de 12 meses
+REFERENCIA = TODAY.replace(day=1).isoformat()  # cache mensal; janela de 12 meses termina no mês passado
 NDVI_VIS = {"min": 0, "max": 0.9, "palette": ["#8c510a", "#d8b365", "#f6e8c3", "#a6d96a", "#1a9850", "#006837"]}
 SAR_VIS = {"min": -25, "max": -5}
 # Limites do mapa: DF (lat -16.05/-15.50, lon -48.29/-47.31) + ~50 km de margem
@@ -43,9 +45,9 @@ def s1(geom):
             .filter(ee.Filter.eq("instrumentMode", "IW"))
             .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VH")).select("VH"))
 
-def month_series(build, band, geom, scale, n=12):
+def month_series(build, band, geom, scale, inicio, n=12):
     def f(i):
-        s = ee.Date(START.isoformat()).advance(i, "month")
+        s = ee.Date(inicio).advance(i, "month")
         v = build(s, s.advance(1, "month")).reduceRegion(ee.Reducer.mean(), geom, scale, maxPixels=1e9).get(band, -9999)
         return ee.Feature(None, {"m": s.format("YYYY-MM"), "v": v})
     feats = ee.FeatureCollection(ee.List.sequence(0, n - 1).map(f)).getInfo()["features"]
@@ -101,11 +103,66 @@ def quadrado(lat, lon, ha):
                        [lon + dx, lat + dy], [lon - dx, lat + dy], [lon - dx, lat - dy]]]})
 
 # ---------------- Dados: NASA POWER (clima) e Earth Engine (terreno, umidade do solo, vegetação, radar) ----------------
-@st.cache_data(show_spinner=False)
-def clima_power(lat, lon):
+# Grades das fontes regionais: (borda sul/oeste da primeira célula, tamanho da célula), em graus.
+# NASA POWER (meteorologia, MERRA-2): células de 0,5° lat × 0,625° lon centradas em lat = 0,5·k e lon = -180 + 0,625·k
+# (conferido na API: -15,76 e -15,74 caem em células diferentes, e -47,83 e -47,80 também).
+# FLDAS (Earth Engine): pixels de 0,1° com bordas a partir de -180 / -60 (bbox do catálogo), centro em x,x5.
+GRADE_POWER = ((-90.25, 0.5), (-180.3125, 0.625))
+GRADE_FLDAS = ((-60.0, 0.1), (-180.0, 0.1))
+
+def celula(lat, lon, grade):
+    """Centro (lat, lon) da célula da grade onde fica o ponto. Um ponto na divisa vai sempre para a célula
+    ao norte/leste (floor), então o mesmo ponto dá sempre a mesma célula."""
+    def c(x, borda, passo):
+        return round(borda + (math.floor(round((x - borda) / passo, 9)) + 0.5) * passo, 6)
+    (b_lat, p_lat), (b_lon, p_lon) = grade
+    return float(c(lat, b_lat, p_lat)), float(c(lon, b_lon, p_lon))
+
+class _NaoEstaNoCache(Exception):
+    """Levantada por `_so_cache`: a fonte foi chamada só para ler o cache."""
+
+def _so_cache(): raise _NaoEstaNoCache
+
+def ler_clima_df(hoje=None):
+    """Lê e valida a cada execução, sem esconder mudanças, ausência ou corrupção no cache."""
+    hoje = hoje or dt.date.today()
+    try:
+        with open(os.path.join(os.path.dirname(__file__), "data", "clima_power_df.json"), encoding="utf-8") as arquivo:
+            dados = json.load(arquivo)
+        periodo = dados["periodo"]
+        if (type(dados["versao"]) is not int or dados["versao"] != 1 or dados["fonte"] != "NASA POWER"
+                or type(periodo["inicio"]) is not int or periodo["inicio"] != 2015
+                or type(periodo["fim"]) is not int or not 2015 <= periodo["fim"] < hoje.year
+                or dados["grade"] != {"origem_lat": GRADE_POWER[0][0], "passo_lat": GRADE_POWER[0][1],
+                                     "origem_lon": GRADE_POWER[1][0], "passo_lon": GRADE_POWER[1][1]}
+                or not isinstance(dados["celulas"], dict) or not dados["celulas"]):
+            return None
+        celulas = {}
+        for chave, meses in dados["celulas"].items():
+            coords = tuple(float(x) for x in chave.split(","))
+            if (len(coords) != 2 or not all(math.isfinite(x) for x in coords)
+                    or celula(*coords, GRADE_POWER) != coords or f"{coords[0]:g},{coords[1]:g}" != chave
+                    or set(meses) != {str(m) for m in range(1, 13)}):
+                return None
+            for valores in meses.values():
+                if (not isinstance(valores, dict) or set(valores) != {"t", "chuva", "ur"}
+                        or any(type(v) not in (int, float) or not math.isfinite(v) for v in valores.values())):
+                    return None
+            celulas[chave] = {int(m): valores for m, valores in meses.items()}
+        return {"periodo": periodo, "celulas": celulas}
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError):
+        return None
+
+@st.cache_data(show_spinner=False, persist="disk")
+def clima_power(lat, lon, ano_fim, _calc=None):
+    """Clima da célula da POWER com centro (lat, lon), média mensal de 2015 a `ano_fim`. O cache é por célula e
+    fica em disco (sobrevive a um reinício; falha não é gravada porque a exceção sobe). Sem ttl, que o Streamlit
+    ignora com persist="disk": `ano_fim` está na chave, então na virada do ano a consulta é outra. `_calc` fica fora
+    da chave do cache (começa com _) e serve para `coletar` ler ou preencher o cache na thread principal."""
+    if _calc: return _calc()
     r = requests.get("https://power.larc.nasa.gov/api/temporal/monthly/point", timeout=40, params=dict(
         parameters="T2M,PRECTOTCORR,RH2M", community="AG", longitude=lon, latitude=lat,
-        start=2015, end=TODAY.year - 1, format="JSON"))
+        start=2015, end=ano_fim, format="JSON"))
     r.raise_for_status(); p = r.json()["properties"]["parameter"]
     def med(par, m):
         v = [x for k, x in p[par].items() if len(k) == 6 and k.endswith(f"{m:02d}") and x > -900]
@@ -116,47 +173,118 @@ def clima_power(lat, lon):
         out[m] = dict(t=med("T2M", m), chuva=None if ch is None else ch * DIAS[m - 1], ur=med("RH2M", m))
     return out
 
-def terreno(geom):
+@st.cache_data(show_spinner=False)
+def terreno(gj, _calc=None):
+    if _calc: return _calc()
+    geom = ee.Geometry(json.loads(gj))
     e = ee.Image("USGS/SRTMGL1_003")
     r = e.addBands(ee.Terrain.slope(e)).reduceRegion(ee.Reducer.mean(), geom, 30, maxPixels=1e9).getInfo()
     return dict(alt=r["elevation"], decl=r["slope"])
 
-def umidade_solo(geom):
-    """Umidade do solo (0-10 cm, NASA GLDAS, ~25 km): último mês disponível vs. o mesmo mês em 2010-hoje."""
-    ponto, banda = geom.centroid(1), "SoilMoi0_10cm_inst"
-    col = ee.ImageCollection("NASA/GLDAS/V021/NOAH/G025/T3H").select(banda)
-    ser = month_series(lambda s, e: col.filterDate(s, e).mean(), banda, ponto, 27830).dropna()
-    if ser.empty: return None
-    mes, atual = int(ser.index[-1][5:]), float(ser.iloc[-1])
-    def f(y):
-        s = ee.Date.fromYMD(y, mes, 1)
-        v = col.filterDate(s, s.advance(1, "month")).mean().reduceRegion(ee.Reducer.mean(), ponto, 27830).get(banda, -9999)
-        return ee.Feature(None, {"v": v})
-    feats = ee.FeatureCollection(ee.List.sequence(2010, TODAY.year - 1).map(f)).getInfo()["features"]
-    vals = [x["properties"]["v"] for x in feats if x["properties"].get("v") is not None and x["properties"]["v"] > -9000]
-    return dict(pct=sum(v < atual for v in vals) / len(vals), mes=mes) if vals else None
+@st.cache_data(show_spinner=False)
+def umidade_solo(lat, lon, referencia, _calc=None):
+    """Umidade do solo (0-10 cm, NASA FLDAS, mensal, 0,1° ≈ 11 km) no pixel com centro (lat, lon): último mês
+    publicado vs. o mesmo mês de 2010 até o ano anterior ao dele. A série inteira vem num único getInfo e o percentil
+    é calculado aqui. O cache é por pixel e mês de referência; `_calc` como em `clima_power`."""
+    if _calc: return _calc()
+    ponto, banda = ee.Geometry({"type": "Point", "coordinates": [lon, lat]}), "SoilMoi00_10cm_tavg"
+    ref = dt.date.fromisoformat(referencia)
+    fim = dt.date(ref.year + (ref.month == 12), ref.month % 12 + 1, 1)  # inclui o mês de referência, se publicado
+    col = (ee.ImageCollection("NASA/FLDAS/NOAH01/C/GL/M/V001").select(banda)
+           .filterDate("2010-01-01", fim.isoformat()))
+    feats = ee.FeatureCollection(col.map(lambda img: ee.Feature(None, {
+        "m": img.date().format("YYYY-MM"),
+        "v": img.reduceRegion(ee.Reducer.mean(), ponto, 11132).get(banda)}))).getInfo()["features"]
+    serie = {}  # (ano, mês) -> valor; meses sem dado (pixel mascarado, ex.: água) ficam de fora
+    for x in feats:
+        m, v = x["properties"].get("m"), x["properties"].get("v")
+        if m and v is not None and v == v and v > -9000:
+            serie[(int(m[:4]), int(m[5:7]))] = float(v)
+    if not serie: return None
+    ano, mes = max(serie)
+    atual = serie[(ano, mes)]
+    vals = [v for (a, m), v in serie.items() if m == mes and 2010 <= a < ano]  # anos sem dado no mês são ignorados
+    return dict(pct=sum(v < atual for v in vals) / len(vals), mes=mes, ano=ano) if vals else None
 
 def _ou_none(ser): return None if ser.dropna().empty else ser
 
 @st.cache_data(show_spinner=False)
-def coletar(gj):
-    """Junta tudo o que o satélite sabe da área. O que falhar fica None (e a tela avisa que não temos o dado)."""
-    lat, lon = centro_de(gj); d, erros = {}, {}
-    def tentar(k, fn):
-        try: d[k] = fn()
-        except Exception as e: d[k] = None; erros[k] = str(e)[:300]
-    tentar("clima", lambda: clima_power(round(lat, 1), round(lon, 1)))
+def ndvi(gj, referencia, _calc=None):
+    if _calc: return _calc()
+    geom = ee.Geometry(json.loads(gj))
+    ref = dt.date.fromisoformat(referencia)
+    inicio = ref.replace(year=ref.year - 1).isoformat()
+    return _ou_none(month_series(lambda s, e: ee.ImageCollection("MODIS/061/MOD13Q1")
+                    .filterDate(s, e).select("NDVI").mean(), "NDVI", geom, 250, inicio) * 1e-4)
+
+def tentar(fontes):
+    """Sucessos (inclusive None) ficam no cache de cada fonte. Falhas ficam só nesta sessão por 120s desde a
+    conclusão, por fonte e argumentos (célula para clima/solo). Apenas misses sem pausa rodam em paralelo.
+    Todas as leituras/escritas st.* ficam aqui, na thread principal; workers chamam somente __wrapped__."""
+    falhas = st.session_state.setdefault("falhas_fontes", {})
+    agora = monotonic()
+    for chave, (quando, erro) in list(falhas.items()):
+        if agora - quando >= 120:
+            del falhas[chave]
+    d, erros, tarefas = {}, {}, {}
+    for k, (fn, args) in fontes.items():
+        try:
+            d[k] = fn(*args, _calc=_so_cache)
+            falhas.pop((k, args), None)  # outra sessão pode já ter recuperado esta fonte
+        except _NaoEstaNoCache:
+            falha = falhas.get((k, args))
+            if falha:
+                d[k], erros[k] = None, falha[1]
+            else:
+                tarefas[k] = (fn, args)
+    if tarefas:
+        with ThreadPoolExecutor(max_workers=len(tarefas)) as ex:
+            futuros = {k: ex.submit(fn.__wrapped__, *args) for k, (fn, args) in tarefas.items()}
+        for k, futuro in futuros.items():
+            fn, args = tarefas[k]
+            try: d[k] = futuro.result()
+            except Exception as e:
+                d[k] = None
+                erros[k] = str(e)[:300]
+                falhas[(k, args)] = (monotonic(), erros[k])
+            else:
+                fn(*args, _calc=lambda valor=d[k]: valor)
+                falhas.pop((k, args), None)
+    return d, erros
+
+def coletar(gj, referencia, clima_arquivo):
+    """Junta tudo o que o satélite sabe da área. O que falhar fica None (e a tela avisa que não temos o dado).
+    Não cacheia resultados agregados: `tentar` lê sucessos por fonte e controla o intervalo das falhas.
+    Clima local precede a API; clima/solo usam sua grade, terreno a geometria e séries a referência mensal."""
+    lat, lon = centro_de(gj)
+    ref = dt.date.fromisoformat(referencia)
+    grade_clima = celula(lat, lon, GRADE_POWER)
+    chave_clima = f"{grade_clima[0]:g},{grade_clima[1]:g}"
+    local = clima_arquivo and clima_arquivo["celulas"].get(chave_clima)
+    periodo = clima_arquivo["periodo"] if local else {"inicio": 2015, "fim": ref.year - 1}
+    # Sem cache agregado, o arquivo validado mais recente é usado mesmo após erros ou cache antigo da API.
+    fontes = {} if local else {"clima": (clima_power, (*grade_clima, ref.year - 1))}
     if EE_OK:
-        geom = ee.Geometry(json.loads(gj))
-        tentar("terreno", lambda: terreno(geom))
-        tentar("solo", lambda: umidade_solo(geom))
-        tentar("veg", lambda: _ou_none(month_series(lambda s, e: ee.ImageCollection("MODIS/061/MOD13Q1")
-                .filterDate(s, e).select("NDVI").mean(), "NDVI", geom, 250) * 1e-4))
-        tentar("radar", lambda: _ou_none(month_series(lambda s, e: lee(s1(geom).filterDate(s, e).median()).rename("VH"), "VH", geom, 30)))
-    else:
+        fontes["terreno"] = (terreno, (gj,))
+        fontes["solo"] = (umidade_solo, (*celula(lat, lon, GRADE_FLDAS), referencia))
+        fontes["veg"] = (ndvi, (gj, referencia))
+    d, erros = tentar(fontes)
+    if local: d["clima"] = local
+    d = {k: d[k] for k in ("clima", "terreno", "solo", "veg") if k in d}  # mesma ordem de antes
+    if not EE_OK:
         erros["gee"] = EE_ERRO
     d["erros"] = erros
+    d["clima_periodo"] = periodo
     return d
+
+@st.cache_data(show_spinner=False)
+def radar_vh(gj, referencia, _calc=None):
+    """Série mensal do radar Sentinel-1 VH com filtro Lee (só no modo técnico; None se não houver imagem)."""
+    if _calc: return _calc()
+    geom = ee.Geometry(json.loads(gj))
+    ref = dt.date.fromisoformat(referencia)
+    inicio = ref.replace(year=ref.year - 1).isoformat()
+    return _ou_none(month_series(lambda s, e: lee(s1(geom).filterDate(s, e).median()).rename("VH"), "VH", geom, 30, inicio))
 
 # ---------------- Recomendação (regras explicáveis) ----------------
 def janela(mes, n): return [(mes - 1 + i) % 12 + 1 for i in range(max(1, min(n, 4)))]
@@ -242,17 +370,44 @@ def confianca(d):
     n = sum(d.get(k) is not None for k in ("clima", "terreno", "solo", "veg"))
     return "alta" if n == 4 else "média" if n >= 2 else "baixa"
 
-@st.cache_data(show_spinner=False)
-def layers(gj):
-    geom = ee.Geometry(json.loads(gj)); box = geom.buffer(1500).bounds()
-    end = ee.Date(TODAY.isoformat())
-    hls = (ee.ImageCollection("NASA/HLS/HLSL30/v002").filterBounds(geom).filterDate(end.advance(-120, "day"), end)
-           .map(lambda i: i.updateMask(i.select("Fmask").bitwiseAnd(14).eq(0)).normalizedDifference(["B5", "B4"]))
-           .median().clip(box))
-    raw = s1(geom).filterDate(end.advance(-60, "day"), end).median()
-    out = {"Saúde da vegetação (verde = saudável)": (hls, NDVI_VIS), "Radar (bruto, com ruído)": (raw.clip(box), SAR_VIS),
-           "Radar (filtrado)": (lee(raw).clip(box), SAR_VIS)}
-    return {k: i.getMapId(v)["tile_fetcher"].url_format for k, (i, v) in out.items()}
+CAMADAS = ("Saúde da vegetação (verde = saudável)", "Radar (bruto, com ruído)", "Radar (filtrado)")
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def layers(gj, referencia, _hoje, _calc=None):
+    """URLs das camadas do modo técnico: {"urls": {nome: url}, "falhas": {nome: erro}}. Cada camada é montada e
+    pedida (getMapId) na sua própria thread, sem nenhuma chamada st.*; a falha de uma não apaga as outras. Nunca
+    levanta exceção, então o resultado (com as falhas) fica no cache e o mapa não fica tentando de novo a cada
+    execução. A chave muda na virada do mês. Ao renovar pelo ttl, a janela diária termina no dia da consulta.
+    `_calc` como em `clima_power` (com `_so_cache`, só lê o cache)."""
+    if _calc: return _calc()
+    def montar(nome):
+        geom = ee.Geometry(json.loads(gj)); box = geom.buffer(1500).bounds()
+        end = ee.Date(_hoje)
+        if nome == CAMADAS[0]:
+            img = (ee.ImageCollection("NASA/HLS/HLSL30/v002").filterBounds(geom).filterDate(end.advance(-120, "day"), end)
+                   .map(lambda i: i.updateMask(i.select("Fmask").bitwiseAnd(14).eq(0)).normalizedDifference(["B5", "B4"]))
+                   .median().clip(box))
+            vis = NDVI_VIS
+        else:
+            raw = s1(geom).filterDate(end.advance(-60, "day"), end).median()
+            img, vis = (raw if nome == CAMADAS[1] else lee(raw)).clip(box), SAR_VIS
+        return img.getMapId(vis)["tile_fetcher"].url_format
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        futuros = {nome: ex.submit(montar, nome) for nome in CAMADAS}
+    urls, falhas = {}, {}
+    for nome, f in futuros.items():
+        try: urls[nome] = f.result()
+        except Exception as e: falhas[nome] = str(e)[:300]
+    return dict(urls=urls, falhas=falhas)
+
+CARREGANDO_CAMADAS = "Carregando as camadas de vegetação e radar…"
+
+def aviso_camadas(falhas):
+    """Mensagem curta sobre as camadas que não puderam ser carregadas."""
+    if len(falhas) == len(CAMADAS): return "Não foi possível carregar as camadas de vegetação e radar."
+    nomes = [f"“{n}”" for n in CAMADAS if n in falhas]
+    return (f"Não foi possível carregar a camada {nomes[0]}." if len(nomes) == 1
+            else f"Não foi possível carregar as camadas {', '.join(nomes[:-1])} e {nomes[-1]}.")
 
 # --- MAPA ---
 from branca.element import MacroElement, Template
@@ -297,7 +452,7 @@ class _LimitarMapa(MacroElement):
 ZOOM_MIN = 9
 COR = "#F5B700"  # amarelo de ipê: contrasta com o satélite e com o mapa
 
-def construir_mapa(gj, urls, desenho):
+def construir_mapa(gj, desenho):
     # obs.: com tiles=None o folium ignora min_zoom/max_zoom; os limites de zoom são aplicados em _LimitarMapa
     m = folium.Map(location=[-15.78, -47.80], zoom_start=10, tiles=None, max_bounds=True, **DF_BOUNDS)
     folium.TileLayer("OpenStreetMap", name="Mapa", no_wrap=True, show=False).add_to(m)
@@ -313,21 +468,56 @@ def construir_mapa(gj, urls, desenho):
     if gj:
         pts = pontos(gj)
         folium.GeoJson(json.loads(gj), name="Sua terra", style_function=lambda _: {"color": COR, "weight": 3, "fillOpacity": 0.15}).add_to(m)
-        for name, url in urls.items():
-            folium.TileLayer(tiles=url, attr="Google Earth Engine", name=name, overlay=True, show=name.startswith("Saúde")).add_to(m)
         m.fit_bounds([[min(p[1] for p in pts), min(p[0] for p in pts)], [max(p[1] for p in pts), max(p[0] for p in pts)]],
                      padding=(40, 40), max_zoom=15)  # centraliza na terra marcada
     else:
         m.fit_bounds([[-16.07, -48.30], [-15.48, -47.30]])  # começa mostrando o DF inteiro
-    folium.LayerControl(collapsed=True).add_to(m)
-    _LimitarMapa(DF_BOUNDS, ZOOM_MIN).add_to(m)
+    _LimitarMapa(DF_BOUNDS, ZOOM_MIN).add_to(m)  # o controle de camadas vai à parte, em `grupos_camadas` (#15)
     return m
+
+class _Visiveis(MacroElement):
+    """Depois de trocar as camadas, deixa visíveis só as que o usuário tinha ligado (no começo, só a vegetação).
+    O st_folium liga todos os grupos de `feature_group_to_add`; aqui os outros são tirados do mapa. Só conta o que
+    o usuário fez no controle de camadas (`_handlingClick`), não a troca dos grupos pelo st_folium."""
+    _template = Template("""{% macro script(this, kwargs) %}
+    (function () {
+      var m = {{ this._parent._parent.get_name() }}, grupos = { {% for g in this.grupos %}{{ g.layer_name|tojson }}: {{ g.get_name() }},{% endfor %} };
+      var vis = window._rotadf_visiveis;
+      if (!vis) {
+        vis = window._rotadf_visiveis = {{ this.inicio|tojson }};
+        var anotar = function (e) { if (window.layer_control && window.layer_control._handlingClick) vis[e.name] = e.type === 'overlayadd'; };
+        m.on('overlayadd', anotar); m.on('overlayremove', anotar);
+      }
+      for (var n in grupos) { if (!vis[n]) m.removeLayer(grupos[n]); }
+    })();
+    {% endmacro %}""")
+    def __init__(self, grupos):
+        super().__init__()
+        # Inclui camadas ainda indisponíveis, para a recuperação manter seu padrão sem sobrescrever escolhas.
+        self.grupos, self.inicio = grupos, {nome: nome == CAMADAS[0] for nome in CAMADAS}
+
+def grupos_camadas(urls):
+    """Camadas do modo técnico, uma por FeatureGroup, para o `feature_group_to_add` do st_folium (#15): o mapa já
+    aberto troca só esses grupos e o controle de camadas, sem recarregar; terra, zoom e posição ficam como estão."""
+    grupos = []
+    for nome in CAMADAS:
+        if nome in urls:
+            g = folium.FeatureGroup(name=nome, show=nome == CAMADAS[0])
+            folium.TileLayer(tiles=urls[nome], attr="Google Earth Engine", name=nome).add_to(g)
+            grupos.append(g)
+    if grupos:
+        fim = folium.FeatureGroup(name="Camadas visíveis", control=False)  # roda depois de todos os grupos
+        _Visiveis(list(grupos)).add_to(fim); grupos.append(fim)
+    return grupos
 # --- FIM MAPA ---
 
 # ---------------- Interface ----------------
 import html as _h
+# Fontes servidas pelo próprio app (static/, `enableStaticServing`), sem Google Fonts (#12): só o subconjunto
+# latino do Google Fonts (acentos do português), licença SIL OFL em static/OFL-*.txt.
 CSS = """
-@import url('https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Public+Sans:wght@400;500;600&display=swap');
+@font-face{font-family:'Bricolage Grotesque';font-style:normal;font-weight:500 700;font-display:swap;src:url('app/static/BricolageGrotesque-latin.woff2') format('woff2');unicode-range:U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD}
+@font-face{font-family:'Public Sans';font-style:normal;font-weight:400 600;font-display:swap;src:url('app/static/PublicSans-latin.woff2') format('woff2');unicode-range:U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD}
 :root{--bg:#F2F4F1;--papel:#fff;--tinta:#16241D;--verde:#1D4D3B;--verde-cl:#DDE8E0;--ipe:#E8B000;--terra:#9C4A2F;--linha:#D9DFDA;--mut:#5F6B64}
 .stApp{background:var(--bg);color:var(--tinta)}
 .stApp,.stMarkdown,.stMarkdown p,label,button,input,[data-baseweb]{font-family:'Public Sans',system-ui,sans-serif}
@@ -435,14 +625,24 @@ if modo == M_CLICK and st.session_state["centro"]:
 else:
     gj = st.session_state["gj_desenho"] if modo == M_DESENHO else None
 
-left, right = st.columns([1.7, 1], gap="large")
-with left:
-    try:
-        urls = layers(gj) if (gj and tecnico and EE_OK) else {}
-    except Exception:
-        urls = {}  # o mapa continua funcionando sem as camadas
-    out = st_folium(construir_mapa(gj, urls, modo == M_DESENHO), height=600, use_container_width=True,
-                    key=f"mapa{st.session_state['map_v']}", returned_objects=["last_clicked", "last_active_drawing"]) or {}
+RENOVAR_CAMADAS = 600  # s; a aba parada confere as camadas a cada 10 min e o `ttl` de `layers` renova a cada hora (#15)
+
+def mapa(gj, tecnico, modo, vez):
+    """Mapa, cliques/desenho e aviso das camadas. É um fragmento: com o modo técnico ligado e uma terra marcada, roda
+    sozinho a cada RENOVAR_CAMADAS, mesmo com a aba parada, para as URLs das camadas não expirarem (#15). Nessa volta
+    sozinho (`vez` já consumido) `layers` é chamado direto: se o cache expirou, renova ali mesmo, e o mapa aberto só
+    troca as camadas. Na execução completa, camadas fora do cache ficam para o fim da página (#7)."""
+    completa, cam, pendentes = next(vez, False), None, False
+    if gj and tecnico and EE_OK:
+        if completa:
+            try: cam = layers(gj, REFERENCIA, TODAY.isoformat(), _calc=_so_cache)
+            except _NaoEstaNoCache: pendentes = True
+        else:  # dia de hoje, não o da última execução completa (a aba pode estar parada há horas)
+            hoje = dt.date.today(); cam = layers(gj, hoje.replace(day=1).isoformat(), hoje.isoformat())
+    out = st_folium(construir_mapa(gj, modo == M_DESENHO), height=600, use_container_width=True,
+                    key=f"mapa{st.session_state['map_v']}", returned_objects=["last_clicked", "last_active_drawing"],
+                    feature_group_to_add=grupos_camadas(cam["urls"] if cam else {}),
+                    layer_control=folium.LayerControl(collapsed=True)) or {}
     if modo == M_CLICK:
         c = out.get("last_clicked")
         if c and (c["lat"], c["lng"]) != st.session_state["ultimo_clique"]:
@@ -451,6 +651,129 @@ with left:
         dr = out.get("last_active_drawing")
         if dr and json.dumps(dr["geometry"]) != gj:
             st.session_state["gj_desenho"] = json.dumps(dr["geometry"]); st.rerun()
+    aviso = st.empty()  # perto do mapa; some quando as camadas entram
+    if pendentes: aviso.caption(CARREGANDO_CAMADAS)
+    elif cam and cam["falhas"]: aviso.caption(aviso_camadas(cam["falhas"]))
+    elif gj and tecnico and not EE_OK: aviso.caption(aviso_camadas(CAMADAS))
+    return pendentes, aviso
+
+left, right = st.columns([1.7, 1], gap="large")
+with left:  # modo técnico desligado: sem run_every, a aba parada não roda nada (nem consulta o Earth Engine)
+    renovar = RENOVAR_CAMADAS if gj and tecnico and EE_OK else None
+    camadas_pendentes, aviso = st.fragment(mapa, run_every=renovar)(gj, tecnico, modo, iter([True]))
+
+def carregar_camadas():
+    """Calcula as camadas que ficaram fora do cache (agora já no cache de `layers`, por gj) e redesenha o mapa com
+    elas. Como a chave é a terra, um clique em outro ponto no meio do caminho não leva estas camadas para a terra nova."""
+    if not camadas_pendentes: return
+    try: layers(gj, REFERENCIA, TODAY.isoformat())
+    except Exception: aviso.caption(aviso_camadas(CAMADAS)); return  # não deveria acontecer: layers não levanta
+    st.rerun()
+
+resultados = st.empty()  # abaixo do mapa e da coluna da direita; o fragmento do passo 2 escreve aqui (#6)
+
+def passo2(gj, ha, area, tecnico, vez):
+    """Passo 2 e resultados (#6). É um fragmento: mudar uma resposta roda só ele, e o mapa (outro fragmento) não é
+    reconstruído nem mandado de novo ao navegador. Os widgets ficam dentro do fragmento (coluna da direita); os
+    resultados não têm widgets e vão para `area`, um `st.empty` criado fora, que cada volta substitui (não acumula).
+    O que muda a terra fica fora, no passo 1 e no mapa, e roda a página inteira. A cada execução, data e JSON são
+    relidos e `coletar` usa o cache por fonte, permitindo retentativas e viradas sem congelar o agregado.
+    Só a primeira execução (completa) pode carregar as camadas adiadas; reruns do formulário não reenviam o mapa."""
+    completa = next(vez, False)
+    hoje = dt.date.today()
+    referencia = hoje.replace(day=1).isoformat()
+    html('<div class="passo"><b>2</b><span>Conte um pouco sobre você</span></div>')
+    nivel = escolha("Você já plantou antes?", list(NIVEIS), "nivel")
+    irriga = escolha("Tem água para irrigar?", list(AGUA), "agua")
+    obj = escolha("O que você quer?", list(OBJ), "obj")
+    mes = st.selectbox("Quando pretende plantar?", list(range(1, 13)), index=hoje.month - 1, key="mes",
+                       format_func=lambda m: MES[m - 1].capitalize() + (" (este mês)" if m == hoje.month else ""))
+    ult_nome = st.selectbox("O que plantou por último nesta terra?", [NUNCA, PARADA] + [c["nome"] for c in CAT], key="ult")
+    with area.container():
+        with st.spinner("Consultando os satélites… pode levar um minuto."):
+            d = coletar(gj, referencia, ler_clima_df(hoje))
+        resultado(d, dict(nivel=NIVEIS[nivel], irriga=AGUA[irriga], obj=OBJ[obj], ha=ha), mes, POR_NOME.get(ult_nome))
+        if completa: carregar_camadas()  # mantém o mapa antes do radar no primeiro carregamento (#7)
+        parecer(d, gj, referencia, tecnico)
+
+def resultado(d, perfil, mes, ultimo):
+    """Recomendação, plano de rotação e o que sabemos sobre a terra (só elementos sem interação)."""
+    ok, motivos = ranking(d, perfil, mes, ultimo)
+
+    html(f'<h2 class="sec">O que combina com a sua terra em {MES[mes - 1]}</h2>')
+    if not ok:
+        html('<p class="nota">Nada combina bem com a sua terra nesta época. ' + (
+            "Sem irrigação a chuva não é suficiente e várias culturas dessa época precisam de água. Tente outro mês ou veja se dá para irrigar."
+            if not perfil["irriga"] else "Tente outro mês.") + "</p>")
+    else:
+        html(destaque(ok[0], mes))
+        if len(ok) > 1:
+            html("<div>" + "".join(linha(r) for r in ok[1:4]) + "</div>")
+        if len(ok) > 4:
+            html('<p class="mut">Também possível: ' + esc(", ".join(r["nome"] for r in ok[4:7])) + ".</p>")
+
+    html('<h2 class="sec">E depois? Um plano de rotação</h2>')
+    seq = plano(d, perfil, mes, ultimo)
+    html('<ol class="trilha">' + "".join(
+        f'<li><time>{MES[mm - 1]}</time><b>{esc(r["nome"])}</b><span>{esc(r["bom"][0] if r["bom"] else r["desc"])}</span>'
+        + (f"<em>A terra descansa {e} mês(es) antes.</em>" if e else "") + "</li>" for mm, r, e in seq) + "</ol>")
+    html('<p class="mut">A ideia é alternar famílias de plantas e incluir uma que devolve nitrogênio ao solo (feijão, crotalária), '
+         'para cuidar da terra e interromper pragas e doenças.</p>')
+
+    html('<h2 class="sec">O que sabemos sobre a sua terra</h2>')
+    cj, t, s, veg = clima_janela(d.get("clima"), mes, 4), d.get("terreno"), d.get("solo"), d.get("veg")
+    nasa = "NASA POWER, vale para a região"
+    html('<dl class="dados">' + "".join([
+        dado("Temperatura nos próximos meses", cj and f"{cj['t']:.0f} °C em média", nasa),
+        dado("Chuva esperada em 4 meses", cj and f"{cj['chuva']:.0f} mm", nasa),
+        dado("Umidade do ar", cj and cj["ur"] is not None and f"{cj['ur']:.0f}%", nasa),
+        dado("Altitude", t and f"{t['alt']:.0f} m", "NASA SRTM, 30 metros"),
+        dado("Terreno", t and ("Plano" if t["decl"] <= 3 else "Inclinado" if t["decl"] <= 6 else "Muito inclinado"), "NASA SRTM, 30 metros"),
+        dado("Umidade do solo", s and ("Bem mais seca que o normal" if s["pct"] < 0.25 else "Um pouco mais seca que o normal"
+             if s["pct"] < 0.4 else "Normal" if s["pct"] <= 0.6 else "Mais úmida que o normal")
+             + f" ({MES[s['mes'] - 1]} de {s['ano']})", "NASA FLDAS, ~11 km, vale para a região"),
+        dado("Meses com pouca planta no último ano", veg is not None and f"{int((veg < 0.3).sum())} de 12", "NASA MODIS, 250 metros")]) + "</dl>")
+    conf = confianca(d)
+    html(f'<p class="nota"><b>Confiança da sugestão: {conf}.</b> ' + {"alta": "Conseguimos todos os dados.",
+         "média": "Faltou algum dado; veja os itens marcados como sem dado.",
+         "baixa": "Faltaram dados importantes, como o clima. Use só como ideia inicial."}[conf] +
+         "<br><b>O que não sabemos:</b> o tipo e a fertilidade do solo, o preço de venda, o que já foi plantado aí e a sua estrutura "
+         "(máquinas, mão de obra). Clima e umidade do solo valem para a região, não só para a sua terra. "
+         "Converse com um agrônomo ou com a Emater-DF antes de decidir.</p>")
+
+def parecer(d, gj, referencia, tecnico):
+    """Parecer e séries são redesenhados junto aos resultados, sem manter erros ou períodos antigos."""
+    radar, erros = None, dict(d.get("erros", {}))
+    if tecnico and EE_OK:  # o radar não entra na recomendação: só é consultado no modo técnico
+        with st.spinner("Carregando o radar…"):
+            dados_radar, falhas_radar = tentar({"radar": (radar_vh, (gj, referencia))})
+            radar = dados_radar["radar"]
+            erros.update(falhas_radar)
+
+    with st.expander("Parecer técnico (para quem entende do assunto)"):
+        periodo = d["clima_periodo"]
+        fontes = [("Clima (T2M, chuva, UR)", d.get("clima"), f"NASA POWER, média mensal {periodo['inicio']}–{periodo['fim']}, ~50 km"),
+                  ("Altitude e declive", d.get("terreno"), "NASA SRTM, 30 m"),
+                  ("Umidade do solo 0–10 cm", d.get("solo"), "NASA FLDAS Noah, mensal, 0,1° (~11 km); "
+                   "percentil do último mês vs. o mesmo mês de 2010 até o ano anterior"),
+                  ("NDVI mensal", d.get("veg"), "NASA MODIS MOD13Q1, 250 m (últimos 12 meses)"),
+                  ("Radar VH com filtro Lee", radar, "Sentinel-1 GRD (ESA), 30 m, Lee 5×5, ENL 4,4")]
+        disp = lambda n, v: "só no modo técnico" if n.startswith("Radar") and not tecnico else "sim" if v is not None else "NÃO"
+        st.dataframe(pd.DataFrame([{"Dado": n, "Disponível": disp(n, v), "Fonte / resolução": f} for n, v, f in fontes]),
+                     hide_index=True, width="stretch")
+        for k, e in erros.items(): st.caption(f"Falha em '{k}': {e}")
+        if d.get("clima"):
+            st.markdown("**Clima mensal (média do período)**")
+            st.dataframe(pd.DataFrame([{"Mês": MES[m - 1], "T média (°C)": v["t"], "Chuva (mm)": v["chuva"], "UR (%)": v["ur"]}
+                                       for m, v in d["clima"].items()]).round(1), hide_index=True, width="stretch")
+        if d.get("veg") is not None: st.markdown("**NDVI mensal (MODIS)**"); st.line_chart(d["veg"])
+        if radar is not None: st.markdown("**Radar VH filtrado (dB)**"); st.line_chart(radar)
+        st.markdown("**Método.** Ranking por regras (não é modelo treinado): janela de plantio, temperatura média e chuva do ciclo "
+                    "(até 4 meses) contra a faixa da cultura; exigência de irrigação; dificuldade vs. experiência; área mínima; objetivo; "
+                    "rotação (mesma família penaliza; leguminosa após não leguminosa e gramínea após leguminosa bonificam); declive > 6° favorece "
+                    "culturas de cobertura; umidade do solo abaixo do percentil 30 (sem irrigação). NDVI e filtro Lee seguem os notebooks "
+                    "NDVI/GEE_multiplas_datas e Lee_filter do curso. As faixas e janelas das culturas são referência agronômica geral e "
+                    "precisam de validação (Emater-DF, Embrapa Hortaliças/Cerrados). Clima e solo têm resolução (10–50 km) maior que a terra.")
 
 with right, st.container(border=True):
     html('<div class="passo"><b>1</b><span>Marque a sua terra</span></div>')
@@ -467,81 +790,8 @@ with right, st.container(border=True):
         st.stop()
     ha = area_ha(gj)
     if ha > 5000:
-        html('<p class="nota">Essa área é muito grande (mais de 5.000 hectares). Marque só a sua terra.</p>'); st.stop()
+        html('<p class="nota">Essa área é muito grande (mais de 5.000 hectares). Marque só a sua terra.</p>')
+        carregar_camadas(); st.stop()
     html(f'<p class="mut">Terra marcada: cerca de {ha:,.0f} hectares.</p>'.replace(",", "."))
 
-    html('<div class="passo"><b>2</b><span>Conte um pouco sobre você</span></div>')
-    nivel = escolha("Você já plantou antes?", list(NIVEIS), "nivel")
-    irriga = escolha("Tem água para irrigar?", list(AGUA), "agua")
-    obj = escolha("O que você quer?", list(OBJ), "obj")
-    mes = st.selectbox("Quando pretende plantar?", list(range(1, 13)), index=TODAY.month - 1, key="mes",
-                       format_func=lambda m: MES[m - 1].capitalize() + (" (este mês)" if m == TODAY.month else ""))
-    ult_nome = st.selectbox("O que plantou por último nesta terra?", [NUNCA, PARADA] + [c["nome"] for c in CAT], key="ult")
-
-with st.spinner("Consultando os satélites… pode levar um minuto."):
-    d = coletar(gj)
-perfil = dict(nivel=NIVEIS[nivel], irriga=AGUA[irriga], obj=OBJ[obj], ha=ha)
-ultimo = POR_NOME.get(ult_nome)
-ok, motivos = ranking(d, perfil, mes, ultimo)
-
-html(f'<h2 class="sec">O que combina com a sua terra em {MES[mes - 1]}</h2>')
-if not ok:
-    html('<p class="nota">Nada combina bem com a sua terra nesta época. ' + (
-        "Sem irrigação a chuva não é suficiente e várias culturas dessa época precisam de água. Tente outro mês ou veja se dá para irrigar."
-        if not perfil["irriga"] else "Tente outro mês.") + "</p>")
-else:
-    html(destaque(ok[0], mes))
-    if len(ok) > 1:
-        html("<div>" + "".join(linha(r) for r in ok[1:4]) + "</div>")
-    if len(ok) > 4:
-        html('<p class="mut">Também possível: ' + esc(", ".join(r["nome"] for r in ok[4:7])) + ".</p>")
-
-html('<h2 class="sec">E depois? Um plano de rotação</h2>')
-seq = plano(d, perfil, mes, ultimo)
-html('<ol class="trilha">' + "".join(
-    f'<li><time>{MES[mm - 1]}</time><b>{esc(r["nome"])}</b><span>{esc(r["bom"][0] if r["bom"] else r["desc"])}</span>'
-    + (f"<em>A terra descansa {e} mês(es) antes.</em>" if e else "") + "</li>" for mm, r, e in seq) + "</ol>")
-html('<p class="mut">A ideia é alternar famílias de plantas e incluir uma que devolve nitrogênio ao solo (feijão, crotalária), '
-     'para cuidar da terra e interromper pragas e doenças.</p>')
-
-html('<h2 class="sec">O que sabemos sobre a sua terra</h2>')
-cj, t, s, veg = clima_janela(d.get("clima"), mes, 4), d.get("terreno"), d.get("solo"), d.get("veg")
-nasa = "NASA POWER, vale para a região"
-html('<dl class="dados">' + "".join([
-    dado("Temperatura nos próximos meses", cj and f"{cj['t']:.0f} °C em média", nasa),
-    dado("Chuva esperada em 4 meses", cj and f"{cj['chuva']:.0f} mm", nasa),
-    dado("Umidade do ar", cj and cj["ur"] is not None and f"{cj['ur']:.0f}%", nasa),
-    dado("Altitude", t and f"{t['alt']:.0f} m", "NASA SRTM, 30 metros"),
-    dado("Terreno", t and ("Plano" if t["decl"] <= 3 else "Inclinado" if t["decl"] <= 6 else "Muito inclinado"), "NASA SRTM, 30 metros"),
-    dado("Umidade do solo agora", s and ("Bem mais seca que o normal" if s["pct"] < 0.25 else "Um pouco mais seca que o normal"
-         if s["pct"] < 0.4 else "Normal" if s["pct"] <= 0.6 else "Mais úmida que o normal"), "NASA GLDAS, vale para a região"),
-    dado("Meses com pouca planta no último ano", veg is not None and f"{int((veg < 0.3).sum())} de 12", "NASA MODIS, 250 metros")]) + "</dl>")
-conf = confianca(d)
-html(f'<p class="nota"><b>Confiança da sugestão: {conf}.</b> ' + {"alta": "Conseguimos todos os dados.",
-     "média": "Faltou algum dado; veja os itens marcados como sem dado.",
-     "baixa": "Faltaram dados importantes, como o clima. Use só como ideia inicial."}[conf] +
-     "<br><b>O que não sabemos:</b> o tipo e a fertilidade do solo, o preço de venda, o que já foi plantado aí e a sua estrutura "
-     "(máquinas, mão de obra). Clima e umidade do solo valem para a região, não só para a sua terra. "
-     "Converse com um agrônomo ou com a Emater-DF antes de decidir.</p>")
-
-with st.expander("Parecer técnico (para quem entende do assunto)"):
-    fontes = [("Clima (T2M, chuva, UR)", d.get("clima"), "NASA POWER, média mensal 2015–" + str(TODAY.year - 1) + ", ~50 km"),
-              ("Altitude e declive", d.get("terreno"), "NASA SRTM, 30 m"),
-              ("Umidade do solo 0–10 cm", d.get("solo"), "NASA GLDAS 2.1 Noah, 0,25°; percentil do mês vs. 2010–hoje"),
-              ("NDVI mensal", d.get("veg"), "NASA MODIS MOD13Q1, 250 m (últimos 12 meses)"),
-              ("Radar VH com filtro Lee", d.get("radar"), "Sentinel-1 GRD (ESA), 30 m, Lee 5×5, ENL 4,4")]
-    st.dataframe(pd.DataFrame([{"Dado": n, "Disponível": "sim" if v is not None else "NÃO", "Fonte / resolução": f} for n, v, f in fontes]),
-                 hide_index=True, width="stretch")
-    for k, e in d.get("erros", {}).items(): st.caption(f"Falha em '{k}': {e}")
-    if d.get("clima"):
-        st.markdown("**Clima mensal (média do período)**")
-        st.dataframe(pd.DataFrame([{"Mês": MES[m - 1], "T média (°C)": v["t"], "Chuva (mm)": v["chuva"], "UR (%)": v["ur"]}
-                                   for m, v in d["clima"].items()]).round(1), hide_index=True, width="stretch")
-    if d.get("veg") is not None: st.markdown("**NDVI mensal (MODIS)**"); st.line_chart(d["veg"])
-    if d.get("radar") is not None: st.markdown("**Radar VH filtrado (dB)**"); st.line_chart(d["radar"])
-    st.markdown("**Método.** Ranking por regras (não é modelo treinado): janela de plantio, temperatura média e chuva do ciclo "
-                "(até 4 meses) contra a faixa da cultura; exigência de irrigação; dificuldade vs. experiência; área mínima; objetivo; "
-                "rotação (mesma família penaliza; leguminosa após não leguminosa e gramínea após leguminosa bonificam); declive > 6° favorece "
-                "culturas de cobertura; umidade do solo abaixo do percentil 30 (sem irrigação). NDVI e filtro Lee seguem os notebooks "
-                "NDVI/GEE_multiplas_datas e Lee_filter do curso. As faixas e janelas das culturas são referência agronômica geral e "
-                "precisam de validação (Emater-DF, Embrapa Hortaliças/Cerrados). Clima e solo têm resolução (25–50 km) maior que a terra.")
+    st.fragment(passo2)(gj, ha, resultados, tecnico, iter([True]))
