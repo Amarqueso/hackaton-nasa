@@ -5,6 +5,7 @@ Rodar: earthengine authenticate ; streamlit run app.py   (.env: GEE_PROJECT=seu-
 from dotenv import load_dotenv
 load_dotenv()
 import os, json, math, datetime as dt
+from concurrent.futures import ThreadPoolExecutor
 import ee, folium, pandas as pd, requests, streamlit as st
 from folium.plugins import Draw
 from streamlit_folium import st_folium
@@ -140,19 +141,25 @@ def _ou_none(ser): return None if ser.dropna().empty else ser
 
 @st.cache_data(show_spinner=False)
 def coletar(gj):
-    """Junta tudo o que o satélite sabe da área. O que falhar fica None (e a tela avisa que não temos o dado)."""
-    lat, lon = centro_de(gj); d, erros = {}, {}
-    def tentar(k, fn):
-        try: d[k] = fn()
-        except Exception as e: d[k] = None; erros[k] = str(e)[:300]
-    tentar("clima", lambda: clima_power(round(lat, 1), round(lon, 1)))
+    """Junta tudo o que o satélite sabe da área. O que falhar fica None (e a tela avisa que não temos o dado).
+    As consultas rodam ao mesmo tempo, uma thread por consulta. Nas threads não há nenhuma chamada st.*:
+    o clima usa a função sem o cache (o cache de coletar já cobre a terra), e d/erros são montados aqui,
+    na thread principal, a partir dos resultados. O Earth Engine usa a sessão aberta uma vez em init_ee."""
+    lat, lon = centro_de(gj)
+    tarefas = {"clima": lambda: clima_power.__wrapped__(round(lat, 1), round(lon, 1))}
     if EE_OK:
         geom = ee.Geometry(json.loads(gj))
-        tentar("terreno", lambda: terreno(geom))
-        tentar("solo", lambda: umidade_solo(geom))
-        tentar("veg", lambda: _ou_none(month_series(lambda s, e: ee.ImageCollection("MODIS/061/MOD13Q1")
-                .filterDate(s, e).select("NDVI").mean(), "NDVI", geom, 250) * 1e-4))
-    else:
+        tarefas["terreno"] = lambda: terreno(geom)
+        tarefas["solo"] = lambda: umidade_solo(geom)
+        tarefas["veg"] = lambda: _ou_none(month_series(lambda s, e: ee.ImageCollection("MODIS/061/MOD13Q1")
+                .filterDate(s, e).select("NDVI").mean(), "NDVI", geom, 250) * 1e-4)
+    with ThreadPoolExecutor(max_workers=len(tarefas)) as ex:
+        futuros = {k: ex.submit(fn) for k, fn in tarefas.items()}
+    d, erros = {}, {}
+    for k, f in futuros.items():  # mesma ordem de antes: clima, terreno, solo, veg
+        try: d[k] = f.result()
+        except Exception as e: d[k] = None; erros[k] = str(e)[:300]
+    if not EE_OK:
         erros["gee"] = EE_ERRO
     d["erros"] = erros
     return d
